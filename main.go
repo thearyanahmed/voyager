@@ -62,33 +62,33 @@ var (
 			Foreground(lipgloss.Color("#626262")).
 			Italic(true)
 	userMsgStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#8B4513")).
+			Foreground(lipgloss.Color("#A0A0A0")).
 			Bold(true).
 			MarginLeft(0).
-			MarginRight(2)
+			MarginRight(0)
 
 	assistantMsgStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#D2691E")).
+				Foreground(lipgloss.Color("#A0A0A0")).
 				Bold(true).
 				MarginLeft(0).
-				MarginRight(2)
+				MarginRight(0)
 
 	systemMsgStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFD23F")).
+			Foreground(lipgloss.Color("#A0A0A0")).
 			Bold(true).
 			MarginLeft(0).
-			MarginRight(2)
+			MarginRight(0)
 
 	msgContentStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#8B4513")).
-			MarginLeft(2).
-			MarginBottom(1)
+			Foreground(lipgloss.Color("#A0A0A0")).
+			MarginLeft(0).
+			MarginBottom(0)
 
 	inputStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#F5F5DC")).
-			Padding(1).
-			Margin(0, 1)
+			BorderForeground(lipgloss.Color("#FAFAF7")).
+			Padding(0).
+			Margin(0)
 
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#626262")).
@@ -129,8 +129,10 @@ func initialModel(config *Config) ChatModel {
 	ta.CharLimit = 4000
 	ta.SetWidth(80)
 	ta.SetHeight(1)
+	ta.MaxHeight = 10
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.ShowLineNumbers = false
+	ta.KeyMap.InsertNewline.SetEnabled(true)
 
 	vp := viewport.New(80, 20)
 	vp.SetContent("")
@@ -171,6 +173,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	)
 
 	m.textarea, tiCmd = m.textarea.Update(msg)
+	m.updateTextareaHeight()
 	m.viewport, vpCmd = m.viewport.Update(msg)
 
 	switch msg := msg.(type) {
@@ -191,7 +194,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.Height = msg.Height - verticalMarginHeight
 		}
 
-		m.textarea.SetWidth(msg.Width - 6)
+		m.textarea.SetWidth(msg.Width)
 
 	case tea.KeyMsg:
 		switch msg.Type {
@@ -237,6 +240,8 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		if msg.err != nil {
 			m.err = msg.err
+		} else if strings.TrimSpace(msg.content) == "" {
+			m.err = fmt.Errorf("received empty response from API")
 		} else {
 			assistantMsg := Message{
 				Role:      "assistant",
@@ -451,12 +456,6 @@ func (m ChatModel) sendOpenAIRequest(provider Provider) (string, error) {
 
 	req.Header.Set("Content-Type", "application/json")
 	if provider.APIKey != "" {
-		// Debug: print first and last few characters of API key
-		keyLen := len(provider.APIKey)
-		if keyLen > 10 {
-			fmt.Printf("Debug: Using API key: %s...%s (length: %d)\n",
-				provider.APIKey[:4], provider.APIKey[keyLen-4:], keyLen)
-		}
 		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
 	}
 
@@ -597,10 +596,7 @@ func (m ChatModel) sendOllamaRequest(provider Provider) (string, error) {
 	}
 
 	url := provider.BaseURL + "/api/chat"
-	fmt.Printf("Debug: Ollama URL: %s\n", url)
-	fmt.Printf("Debug: Model: %s\n", m.currentModel)
-	fmt.Printf("Debug: Request: %s\n", string(requestBody))
-	
+
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
@@ -618,8 +614,6 @@ func (m ChatModel) sendOllamaRequest(provider Provider) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
-
-	fmt.Printf("Debug: Response: %s\n", string(body))
 
 	var apiResp OllamaResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
@@ -756,9 +750,6 @@ func (m ChatModel) sendGitHubRequest(provider Provider) (string, error) {
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Debug: print response body
-	fmt.Printf("GitHub API Response: %s\n", string(body))
-
 	var apiResp GitHubResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
 		// Try to parse as generic response
@@ -785,42 +776,42 @@ func (m ChatModel) sendGitHubRequest(provider Provider) (string, error) {
 	return apiResp.Choices[0].Message.Content, nil
 }
 
+func (m *ChatModel) updateTextareaHeight() {
+	lines := strings.Count(m.textarea.Value(), "\n") + 1
+	if lines < 1 {
+		lines = 1
+	}
+	if lines > 10 {
+		lines = 10
+	}
+	m.textarea.SetHeight(lines)
+}
+
 func (m *ChatModel) updateViewport() {
 	var content strings.Builder
 
 	for _, msg := range m.conversation {
-		timestamp := msg.Timestamp.Format("15:04")
-
 		switch msg.Role {
 		case "user":
-			content.WriteString(userMsgStyle.Render(fmt.Sprintf("🚀 You (%s)", timestamp)))
-			content.WriteString("\n")
-			content.WriteString(msgContentStyle.Render(msg.Content))
-			content.WriteString("\n\n")
+			// Don't show user messages
 
 		case "assistant":
-			content.WriteString(assistantMsgStyle.Render(fmt.Sprintf("🤖 AI (%s)", timestamp)))
-			content.WriteString("\n")
-			content.WriteString(msgContentStyle.Render(msg.Content))
+			content.WriteString(msgContentStyle.Render(strings.TrimLeft(msg.Content, "\n")))
 			content.WriteString("\n\n")
 
 		case "system":
-			content.WriteString(systemMsgStyle.Render(fmt.Sprintf("⚙️  System (%s)", timestamp)))
-			content.WriteString("\n")
-			content.WriteString(msgContentStyle.Render(msg.Content))
+			content.WriteString(systemMsgStyle.Render(msg.Content))
 			content.WriteString("\n\n")
 		}
 	}
 
 	if m.loading {
-		content.WriteString(assistantMsgStyle.Render("🤖 AI"))
+		content.WriteString(msgContentStyle.Render("thinking..."))
 		content.WriteString("\n")
-		content.WriteString(msgContentStyle.Render("🤔 Thinking..."))
-		content.WriteString("\n\n")
 	}
 
 	if m.err != nil {
-		content.WriteString(errorStyle.Render(fmt.Sprintf("❌ Error: %s", m.err.Error())))
+		content.WriteString(errorStyle.Render(m.err.Error()))
 		content.WriteString("\n\n")
 	}
 
@@ -830,25 +821,23 @@ func (m *ChatModel) updateViewport() {
 
 func (m ChatModel) View() string {
 	if !m.ready {
-		return "\n  🚀 Initializing Voyager..."
+		return "\n  Initializing Voyager..."
 	}
 
 	// Header with voyager branding
-	title := titleStyle.Render(fmt.Sprintf(" 🚀 VOYAGER - %s/%s ", m.currentProvider, m.currentModel))
+	title := titleStyle.Render(fmt.Sprintf(" VOYAGER - %s/%s ", m.currentProvider, m.currentModel))
 
 	// Status line
-	status := statusStyle.Render(fmt.Sprintf("🌐 Provider: %s | 🤖 Model: %s | 💬 Messages: %d",
+	status := statusStyle.Render(fmt.Sprintf("Provider: %s | Model: %s | Messages: %d",
 		m.currentProvider, m.currentModel, len(m.conversation)))
 
 	// Help
-	help := helpStyle.Render("🎮 Controls: Enter=Send • Ctrl+C=Quit • /help=Commands")
+	help := helpStyle.Render("Controls: Enter=Send • Ctrl+C=Quit • /help=Commands")
 
-	// Chat area with border
+	// Chat area without border
 	chatArea := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#F5F5DC")).
-		Padding(0).
-		Height(m.viewport.Height + 2).
+		Padding(0, 2).
+		Height(m.viewport.Height).
 		Render(m.viewport.View())
 
 	// Input area
@@ -965,14 +954,14 @@ func saveConfig(config *Config) error {
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "voyager",
-		Short: "🚀 Voyager - Multi-provider AI CLI with beautiful TUI",
+		Short: "Voyager - Multi-provider AI CLI with beautiful TUI",
 		Long:  "Voyager is an interactive TUI for chatting with multiple AI providers: OpenAI, Anthropic, Ollama, and local models.",
 		Run: func(cmd *cobra.Command, args []string) {
 			// Default to chat command when no subcommand provided
 			config, err := loadConfig()
 			if err != nil {
-				fmt.Printf("❌ Error loading config: %v\n", err)
-				fmt.Println("💡 Run 'voyager init' to set up configuration")
+				fmt.Printf("Error loading config: %v\n", err)
+				fmt.Println("Run 'voyager init' to set up configuration")
 				return
 			}
 
@@ -980,7 +969,7 @@ func main() {
 			p := tea.NewProgram(model, tea.WithAltScreen())
 
 			if _, err := p.Run(); err != nil {
-				fmt.Printf("❌ Error running program: %v\n", err)
+				fmt.Printf("Error running program: %v\n", err)
 				os.Exit(1)
 			}
 		},
@@ -989,12 +978,12 @@ func main() {
 	// Chat command with TUI
 	chatCmd := &cobra.Command{
 		Use:   "chat",
-		Short: "🎮 Start interactive chat with TUI",
+		Short: "Start interactive chat with TUI",
 		Run: func(cmd *cobra.Command, args []string) {
 			config, err := loadConfig()
 			if err != nil {
-				fmt.Printf("❌ Error loading config: %v\n", err)
-				fmt.Println("💡 Run 'voyager init' to set up configuration")
+				fmt.Printf("Error loading config: %v\n", err)
+				fmt.Println("Run 'voyager init' to set up configuration")
 				return
 			}
 
@@ -1002,7 +991,7 @@ func main() {
 			p := tea.NewProgram(model, tea.WithAltScreen())
 
 			if _, err := p.Run(); err != nil {
-				fmt.Printf("❌ Error running program: %v\n", err)
+				fmt.Printf("Error running program: %v\n", err)
 				os.Exit(1)
 			}
 		},
@@ -1011,9 +1000,9 @@ func main() {
 	// Initialize command
 	initCmd := &cobra.Command{
 		Use:   "init",
-		Short: "⚙️  Initialize Voyager configuration",
+		Short: "Initialize Voyager configuration",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println("🚀 Initializing Voyager...")
+			fmt.Println("Initializing Voyager...")
 
 			config := &Config{
 				Providers: map[string]Provider{
@@ -1028,34 +1017,34 @@ func main() {
 			}
 
 			if err := saveConfig(config); err != nil {
-				fmt.Printf("❌ Error saving config: %v\n", err)
+				fmt.Printf("Error saving config: %v\n", err)
 				return
 			}
 
-			fmt.Println("✅ Voyager configuration initialized!")
-			fmt.Println("📝 Edit voyager-config.json to add more providers:")
+			fmt.Println("Voyager configuration initialized!")
+			fmt.Println("Edit voyager-config.json to add more providers:")
 			fmt.Println("   - OpenAI (GPT-4, GPT-3.5)")
 			fmt.Println("   - Anthropic (Claude)")
 			fmt.Println("   - Custom local endpoints")
 			fmt.Println()
-			fmt.Println("🎮 Run 'voyager chat' to start your AI journey!")
+			fmt.Println("Run 'voyager chat' to start your AI journey!")
 		},
 	}
 
 	// Add provider command
 	addCmd := &cobra.Command{
 		Use:   "add [provider-name]",
-		Short: "➕ Add a new AI provider",
+		Short: "Add a new AI provider",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			_, err := loadConfig()
 			if err != nil {
-				fmt.Printf("❌ Error loading config: %v\n", err)
+				fmt.Printf("Error loading config: %v\n", err)
 				return
 			}
 
 			providerName := args[0]
-			fmt.Printf("🔧 Adding provider: %s\n", providerName)
+			fmt.Printf("Adding provider: %s\n", providerName)
 			fmt.Println("📋 Example configurations:")
 			fmt.Println(`
 OpenAI:
@@ -1089,7 +1078,7 @@ Local/Custom:
 	// Status command
 	statusCmd := &cobra.Command{
 		Use:   "status",
-		Short: "📊 Show Voyager status",
+		Short: "Show Voyager status",
 		Run: func(cmd *cobra.Command, args []string) {
 			config, err := loadConfig()
 			if err != nil {
@@ -1097,18 +1086,18 @@ Local/Custom:
 				return
 			}
 
-			fmt.Println("🚀 Voyager Status")
-			fmt.Printf("📁 Config file: voyager-config.json\n")
-			fmt.Printf("🔧 Default provider: %s\n", config.DefaultProvider)
+			fmt.Println("Voyager Status")
+			fmt.Printf("Config file: voyager-config.json\n")
+			fmt.Printf("Default provider: %s\n", config.DefaultProvider)
 			fmt.Printf("🤖 Default model: %s\n", config.DefaultModel)
-			fmt.Println("\n📡 Configured providers:")
+			fmt.Println("\nConfigured providers:")
 
 			for name, provider := range config.Providers {
-				status := "✅"
+				status := "OK"
 				if provider.Type != ProviderOllama && provider.APIKey == "" {
-					status = "⚠️  (no API key)"
+					status = "(no API key)"
 				}
-				fmt.Printf("  • %s (%s) %s - %d models\n",
+				fmt.Printf("  %s (%s) %s - %d models\n",
 					name, provider.Type, status, len(provider.Models))
 			}
 		},
@@ -1117,7 +1106,7 @@ Local/Custom:
 	rootCmd.AddCommand(chatCmd, initCmd, addCmd, statusCmd)
 
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Printf("❌ Error: %v\n", err)
+		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 }
