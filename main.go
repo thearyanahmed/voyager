@@ -200,7 +200,7 @@ func initialModel(config *Config, debugEnabled bool) ChatModel {
 	ta.Focus()
 	ta.Prompt = ""
 	ta.CharLimit = 4000
-	ta.SetWidth(80)
+	ta.SetWidth(80) // Will be updated on first window size message
 	ta.SetHeight(1)
 	ta.MaxHeight = 10
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
@@ -285,6 +285,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.WindowSizeMsg:
+		m.debugLog("TUI", "Window resize: %dx%d", msg.Width, msg.Height)
 		m.width = msg.Width
 		m.height = msg.Height
 
@@ -311,7 +312,12 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		m.textarea.SetWidth(msg.Width)
+		// Always update textarea width to fit the terminal, accounting for border (2 chars) and padding (2 chars)
+		textareaWidth := msg.Width - 4
+		if textareaWidth < 10 { // Minimum width
+			textareaWidth = 10
+		}
+		m.textarea.SetWidth(textareaWidth)
 
 	case tea.KeyMsg:
 		switch msg.Type {
@@ -331,12 +337,17 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			userInput := strings.TrimSpace(m.textarea.Value())
 			if userInput == "" {
+				m.debugLog("TUI", "Empty user input, ignoring")
 				break
 			}
 
 			// Handle commands
 			if strings.HasPrefix(userInput, "/") {
-				m.debugLog("TUI", "Processing command: /%s", strings.Fields(userInput[1:])[0])
+				cmdName := "unknown"
+				if parts := strings.Fields(userInput[1:]); len(parts) > 0 {
+					cmdName = parts[0]
+				}
+				m.debugLog("TUI", "Processing command: /%s", cmdName)
 				m.textarea.Reset() // Clear the textarea after command
 				return m.handleCommand(userInput[1:])
 			}
@@ -360,10 +371,13 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case responseMsg:
 		m.loading = false
 		if msg.err != nil {
+			m.debugLog("ERROR", "API response error: %v", msg.err)
 			m.err = msg.err
 		} else if strings.TrimSpace(msg.content) == "" {
+			m.debugLog("ERROR", "Received empty response from API")
 			m.err = fmt.Errorf("received empty response from API")
 		} else {
+			m.debugLog("SUCCESS", "Received API response (%d chars)", len(msg.content))
 			assistantMsg := Message{
 				Role:      "assistant",
 				Content:   msg.content,
@@ -381,8 +395,11 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
+		m.debugLog("TUI", "Empty command received")
 		return *m, nil
 	}
+
+	m.debugLog("TUI", "Executing command: %s with %d args", parts[0], len(parts)-1)
 
 	switch parts[0] {
 	case "clear":
@@ -566,6 +583,9 @@ func (m ChatModel) makeAPIRequest() (string, error) {
 }
 
 func (m ChatModel) sendOpenAIRequest(provider Provider) (string, error) {
+	model := &m
+	model.debugLog("API", "Starting OpenAI request to %s", provider.BaseURL)
+	
 	type OpenAIRequest struct {
 		Model     string    `json:"model"`
 		Messages  []Message `json:"messages"`
@@ -598,26 +618,35 @@ func (m ChatModel) sendOpenAIRequest(provider Provider) (string, error) {
 		MaxTokens: 4000,
 	}
 
+	model.debugLog("API", "OpenAI request: model=%s, messages=%d", m.currentModel, len(apiMessages))
+
 	requestBody, err := json.Marshal(request)
 	if err != nil {
+		model.debugLog("ERROR", "Failed to marshal OpenAI request: %v", err)
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	req, err := http.NewRequest("POST", provider.BaseURL, bytes.NewBuffer(requestBody))
 	if err != nil {
+		model.debugLog("ERROR", "Failed to create OpenAI request: %v", err)
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	if provider.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+		model.debugLog("AUTH", "Using API key for OpenAI request")
 	}
 
+	model.debugLog("NET", "Sending OpenAI HTTP request")
 	resp, err := m.client.Do(req)
 	if err != nil {
+		model.debugLog("ERROR", "OpenAI HTTP request failed: %v", err)
 		return "", fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	model.debugLog("NET", "OpenAI response received (status: %s)", resp.Status)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -644,6 +673,9 @@ func (m ChatModel) sendOpenAIRequest(provider Provider) (string, error) {
 }
 
 func (m ChatModel) sendAnthropicRequest(provider Provider) (string, error) {
+	model := &m
+	model.debugLog("API", "Starting Anthropic request to %s", provider.BaseURL)
+	
 	type AnthropicRequest struct {
 		Model     string    `json:"model"`
 		Messages  []Message `json:"messages"`
@@ -718,6 +750,9 @@ func (m ChatModel) sendAnthropicRequest(provider Provider) (string, error) {
 }
 
 func (m ChatModel) sendOllamaRequest(provider Provider) (string, error) {
+	model := &m
+	model.debugLog("API", "Starting Ollama request to %s", provider.BaseURL)
+	
 	type OllamaRequest struct {
 		Model    string    `json:"model"`
 		Messages []Message `json:"messages"`
@@ -747,15 +782,20 @@ func (m ChatModel) sendOllamaRequest(provider Provider) (string, error) {
 		Stream:   false,
 	}
 
+	model.debugLog("API", "Ollama request: model=%s, messages=%d", m.currentModel, len(apiMessages))
+
 	requestBody, err := json.Marshal(request)
 	if err != nil {
+		model.debugLog("ERROR", "Failed to marshal Ollama request: %v", err)
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	url := provider.BaseURL + "/api/chat"
+	model.debugLog("NET", "Sending Ollama request to %s", url)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
 	if err != nil {
+		model.debugLog("ERROR", "Failed to create Ollama request: %v", err)
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -763,20 +803,26 @@ func (m ChatModel) sendOllamaRequest(provider Provider) (string, error) {
 
 	resp, err := m.client.Do(req)
 	if err != nil {
+		model.debugLog("ERROR", "Ollama HTTP request failed: %v", err)
 		return "", fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	model.debugLog("NET", "Ollama response received (status: %s)", resp.Status)
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		model.debugLog("ERROR", "Failed to read Ollama response: %v", err)
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
 
 	var apiResp OllamaResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
+		model.debugLog("ERROR", "Failed to parse Ollama response: %v", err)
 		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
 
+	model.debugLog("SUCCESS", "Ollama request completed successfully")
 	return apiResp.Message.Content, nil
 }
 
@@ -1190,12 +1236,16 @@ func (m *ChatModel) handleMCPCommand(parts []string) (tea.Model, tea.Cmd) {
 }
 
 func (m *ChatModel) startMCPServer(serverName string) error {
+	m.debugLog("MCP", "Starting MCP server: %s", serverName)
+	
 	server, exists := m.config.MCPServers[serverName]
 	if !exists {
+		m.debugLog("ERROR", "MCP server '%s' not found in configuration", serverName)
 		return fmt.Errorf("MCP server '%s' not found in configuration", serverName)
 	}
 
 	if len(server.Command) == 0 {
+		m.debugLog("ERROR", "MCP server '%s' has no command configured", serverName)
 		return fmt.Errorf("MCP server '%s' has no command configured", serverName)
 	}
 
@@ -1286,17 +1336,22 @@ func (m *ChatModel) startMCPServer(serverName string) error {
 }
 
 func (m *ChatModel) stopMCPServer(serverName string) error {
+	m.debugLog("MCP", "Stopping MCP server: %s", serverName)
+	
 	client, exists := m.mcpClients[serverName]
 	if !exists {
+		m.debugLog("ERROR", "MCP server '%s' is not running", serverName)
 		return fmt.Errorf("MCP server '%s' is not running", serverName)
 	}
 
 	if client.Process != nil && client.Process.Process != nil {
+		m.debugLog("MCP", "Killing MCP server process: %s", serverName)
 		client.Process.Process.Kill()
 		client.Process.Wait()
 	}
 
 	delete(m.mcpClients, serverName)
+	m.debugLog("SUCCESS", "MCP server stopped: %s", serverName)
 	
 	if server, exists := m.config.MCPServers[serverName]; exists {
 		server.Active = false
@@ -1548,10 +1603,12 @@ func (m *ChatModel) debugLog(level string, message string, args ...interface{}) 
 		"WARN":    "\033[33m", // Yellow
 		"MCP":     "\033[35m", // Magenta
 		"NET":     "\033[34m", // Blue
-		"API":     "\033[33m", // Yellow
-		"TUI":     "\033[37m", // White
-		"CONFIG":  "\033[36m", // Cyan
-		"AUTH":    "\033[35m", // Magenta
+		"API":     "\033[93m", // Bright Yellow
+		"TUI":     "\033[97m", // Bright White
+		"CONFIG":  "\033[96m", // Bright Cyan
+		"AUTH":    "\033[95m", // Bright Magenta
+		"LOAD":    "\033[92m", // Bright Green
+		"SAVE":    "\033[94m", // Bright Blue
 	}
 	reset := "\033[0m"
 	
