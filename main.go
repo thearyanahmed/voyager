@@ -24,12 +24,7 @@ import (
 type ProviderType string
 
 const (
-	ProviderAnthropic     ProviderType = "anthropic"
-	ProviderOpenAI        ProviderType = "openai"
-	ProviderOllama        ProviderType = "ollama"
-	ProviderLocal         ProviderType = "local"
-	ProviderGitHub        ProviderType = "github"
-	ProviderDigitalOcean  ProviderType = "digitalocean"
+	ProviderDigitalOcean ProviderType = "digitalocean"
 )
 
 // Provider configuration
@@ -564,16 +559,6 @@ func (m ChatModel) makeAPIRequest() (string, error) {
 	model.debugLog("API", "Starting API request to %s/%s", m.currentProvider, m.currentModel)
 
 	switch provider.Type {
-	case ProviderOpenAI:
-		return m.sendOpenAIRequest(provider)
-	case ProviderAnthropic:
-		return m.sendAnthropicRequest(provider)
-	case ProviderOllama:
-		return m.sendOllamaRequest(provider)
-	case ProviderLocal:
-		return m.sendLocalRequest(provider)
-	case ProviderGitHub:
-		return m.sendGitHubRequest(provider)
 	case ProviderDigitalOcean:
 		return m.sendDigitalOceanRequest(provider)
 	default:
@@ -582,402 +567,10 @@ func (m ChatModel) makeAPIRequest() (string, error) {
 	}
 }
 
-func (m ChatModel) sendOpenAIRequest(provider Provider) (string, error) {
-	model := &m
-	model.debugLog("API", "Starting OpenAI request to %s", provider.BaseURL)
-	
-	type OpenAIRequest struct {
-		Model     string    `json:"model"`
-		Messages  []Message `json:"messages"`
-		MaxTokens int       `json:"max_tokens,omitempty"`
-	}
 
-	type OpenAIResponse struct {
-		Choices []struct {
-			Message Message `json:"message"`
-		} `json:"choices"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
 
-	// Convert messages to API format (without timestamp)
-	apiMessages := make([]Message, len(m.conversation))
-	for i, msg := range m.conversation {
-		if msg.Role != "system" { // Skip system messages for API
-			apiMessages[i] = Message{
-				Role:    msg.Role,
-				Content: msg.Content,
-			}
-		}
-	}
 
-	request := OpenAIRequest{
-		Model:     m.currentModel,
-		Messages:  apiMessages,
-		MaxTokens: 4000,
-	}
 
-	model.debugLog("API", "OpenAI request: model=%s, messages=%d", m.currentModel, len(apiMessages))
-
-	requestBody, err := json.Marshal(request)
-	if err != nil {
-		model.debugLog("ERROR", "Failed to marshal OpenAI request: %v", err)
-		return "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", provider.BaseURL, bytes.NewBuffer(requestBody))
-	if err != nil {
-		model.debugLog("ERROR", "Failed to create OpenAI request: %v", err)
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	if provider.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
-		model.debugLog("AUTH", "Using API key for OpenAI request")
-	}
-
-	model.debugLog("NET", "Sending OpenAI HTTP request")
-	resp, err := m.client.Do(req)
-	if err != nil {
-		model.debugLog("ERROR", "OpenAI HTTP request failed: %v", err)
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	model.debugLog("NET", "OpenAI response received (status: %s)", resp.Status)
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
-
-	var apiResp OpenAIResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	if apiResp.Error != nil {
-		model.debugLog("ERROR", "OpenAI API error: %s", apiResp.Error.Message)
-		return "", fmt.Errorf("API error: %s", apiResp.Error.Message)
-	}
-
-	if len(apiResp.Choices) == 0 {
-		model.debugLog("ERROR", "OpenAI response has no choices")
-		return "", fmt.Errorf("no choices in response")
-	}
-
-	model.debugLog("SUCCESS", "OpenAI request completed successfully")
-	return apiResp.Choices[0].Message.Content, nil
-}
-
-func (m ChatModel) sendAnthropicRequest(provider Provider) (string, error) {
-	model := &m
-	model.debugLog("API", "Starting Anthropic request to %s", provider.BaseURL)
-	
-	type AnthropicRequest struct {
-		Model     string    `json:"model"`
-		Messages  []Message `json:"messages"`
-		MaxTokens int       `json:"max_tokens"`
-	}
-
-	type AnthropicResponse struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-
-	// Convert messages to API format (without timestamp and system messages)
-	var apiMessages []Message
-	for _, msg := range m.conversation {
-		if msg.Role != "system" {
-			apiMessages = append(apiMessages, Message{
-				Role:    msg.Role,
-				Content: msg.Content,
-			})
-		}
-	}
-
-	request := AnthropicRequest{
-		Model:     m.currentModel,
-		Messages:  apiMessages,
-		MaxTokens: 4000,
-	}
-
-	requestBody, err := json.Marshal(request)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", provider.BaseURL, bytes.NewBuffer(requestBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", provider.APIKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
-
-	var apiResp AnthropicResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	if apiResp.Error != nil {
-		return "", fmt.Errorf("API error: %s", apiResp.Error.Message)
-	}
-
-	if len(apiResp.Content) == 0 {
-		return "", fmt.Errorf("no content in response")
-	}
-
-	return apiResp.Content[0].Text, nil
-}
-
-func (m ChatModel) sendOllamaRequest(provider Provider) (string, error) {
-	model := &m
-	model.debugLog("API", "Starting Ollama request to %s", provider.BaseURL)
-	
-	type OllamaRequest struct {
-		Model    string    `json:"model"`
-		Messages []Message `json:"messages"`
-		Stream   bool      `json:"stream"`
-	}
-
-	type OllamaResponse struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	}
-
-	// Convert messages to API format
-	var apiMessages []Message
-	for _, msg := range m.conversation {
-		if msg.Role != "system" {
-			apiMessages = append(apiMessages, Message{
-				Role:    msg.Role,
-				Content: msg.Content,
-			})
-		}
-	}
-
-	request := OllamaRequest{
-		Model:    m.currentModel,
-		Messages: apiMessages,
-		Stream:   false,
-	}
-
-	model.debugLog("API", "Ollama request: model=%s, messages=%d", m.currentModel, len(apiMessages))
-
-	requestBody, err := json.Marshal(request)
-	if err != nil {
-		model.debugLog("ERROR", "Failed to marshal Ollama request: %v", err)
-		return "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	url := provider.BaseURL + "/api/chat"
-	model.debugLog("NET", "Sending Ollama request to %s", url)
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
-	if err != nil {
-		model.debugLog("ERROR", "Failed to create Ollama request: %v", err)
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := m.client.Do(req)
-	if err != nil {
-		model.debugLog("ERROR", "Ollama HTTP request failed: %v", err)
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	model.debugLog("NET", "Ollama response received (status: %s)", resp.Status)
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		model.debugLog("ERROR", "Failed to read Ollama response: %v", err)
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
-
-	var apiResp OllamaResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		model.debugLog("ERROR", "Failed to parse Ollama response: %v", err)
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	model.debugLog("SUCCESS", "Ollama request completed successfully")
-	return apiResp.Message.Content, nil
-}
-
-func (m ChatModel) sendLocalRequest(provider Provider) (string, error) {
-	// Try OpenAI-compatible format first
-	response, err := m.sendOpenAIRequest(provider)
-	if err == nil {
-		return response, nil
-	}
-
-	// Fallback to generic format
-	var apiMessages []Message
-	for _, msg := range m.conversation {
-		if msg.Role != "system" {
-			apiMessages = append(apiMessages, Message{
-				Role:    msg.Role,
-				Content: msg.Content,
-			})
-		}
-	}
-
-	request := map[string]interface{}{
-		"model":      m.currentModel,
-		"messages":   apiMessages,
-		"max_tokens": 4000,
-	}
-
-	requestBody, err := json.Marshal(request)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", provider.BaseURL, bytes.NewBuffer(requestBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	if provider.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
-	}
-
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return string(body), nil // Return raw response as fallback
-	}
-
-	// Try common response field names
-	if content, ok := result["content"].(string); ok {
-		return content, nil
-	}
-	if response, ok := result["response"].(string); ok {
-		return response, nil
-	}
-	if message, ok := result["message"].(string); ok {
-		return message, nil
-	}
-
-	return string(body), nil
-}
-
-func (m ChatModel) sendGitHubRequest(provider Provider) (string, error) {
-	type GitHubRequest struct {
-		Model     string    `json:"model"`
-		Messages  []Message `json:"messages"`
-		MaxTokens int       `json:"max_tokens,omitempty"`
-	}
-
-	type GitHubResponse struct {
-		Choices []struct {
-			Message Message `json:"message"`
-		} `json:"choices"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-
-	// Convert messages to API format (without timestamp)
-	var apiMessages []Message
-	for _, msg := range m.conversation {
-		if msg.Role != "system" {
-			apiMessages = append(apiMessages, Message{
-				Role:    msg.Role,
-				Content: msg.Content,
-			})
-		}
-	}
-
-	request := GitHubRequest{
-		Model:     m.currentModel,
-		Messages:  apiMessages,
-		MaxTokens: 4000,
-	}
-
-	requestBody, err := json.Marshal(request)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", provider.BaseURL, bytes.NewBuffer(requestBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
-	req.Header.Set("User-Agent", "Voyager/1.0")
-
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
-
-	var apiResp GitHubResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		// Try to parse as generic response
-		var genericResp map[string]interface{}
-		if err2 := json.Unmarshal(body, &genericResp); err2 == nil {
-			if content, ok := genericResp["content"].(string); ok {
-				return content, nil
-			}
-			if message, ok := genericResp["message"].(string); ok {
-				return message, nil
-			}
-		}
-		return "", fmt.Errorf("failed to parse response: %w\nResponse: %s", err, string(body))
-	}
-
-	if apiResp.Error != nil {
-		return "", fmt.Errorf("API error: %s", apiResp.Error.Message)
-	}
-
-	if len(apiResp.Choices) == 0 {
-		return "", fmt.Errorf("no choices in response")
-	}
-
-	return apiResp.Choices[0].Message.Content, nil
-}
 
 func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 	type DigitalOceanRequest struct {
@@ -1046,20 +639,49 @@ func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
 
+	// First, try to parse as OpenAI-compatible response
 	var apiResp DigitalOceanResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
+	if err := json.Unmarshal(body, &apiResp); err == nil {
+		if apiResp.Error != nil {
+			return "", fmt.Errorf("API error: %s", apiResp.Error.Message)
+		}
+		
+		if len(apiResp.Choices) > 0 {
+			return apiResp.Choices[0].Message.Content, nil
+		}
 	}
 
-	if apiResp.Error != nil {
-		return "", fmt.Errorf("API error: %s", apiResp.Error.Message)
+	// If OpenAI format fails, try generic response parsing
+	var genericResp map[string]interface{}
+	if err := json.Unmarshal(body, &genericResp); err == nil {
+		// Try common response field names
+		if content, ok := genericResp["content"].(string); ok {
+			return content, nil
+		}
+		if response, ok := genericResp["response"].(string); ok {
+			return response, nil
+		}
+		if message, ok := genericResp["message"].(string); ok {
+			return message, nil
+		}
+		if text, ok := genericResp["text"].(string); ok {
+			return text, nil
+		}
+		
+		// Check for nested content
+		if data, ok := genericResp["data"].(map[string]interface{}); ok {
+			if content, ok := data["content"].(string); ok {
+				return content, nil
+			}
+			if response, ok := data["response"].(string); ok {
+				return response, nil
+			}
+		}
 	}
 
-	if len(apiResp.Choices) == 0 {
-		return "", fmt.Errorf("no choices in response")
-	}
-
-	return apiResp.Choices[0].Message.Content, nil
+	// If all parsing fails, return the raw response for debugging
+	model.debugLog("ERROR", "Unexpected response format: %s", string(body))
+	return string(body), nil
 }
 
 // MCP Client methods
@@ -1749,36 +1371,6 @@ func (m ChatModel) View() string {
 func autoDetectProviders() map[string]Provider {
 	providers := make(map[string]Provider)
 
-	// Auto-detect Anthropic
-	if apiKey := os.Getenv("ANTHROPIC_API_KEY"); apiKey != "" {
-		providers["anthropic"] = Provider{
-			Type:    ProviderAnthropic,
-			BaseURL: "https://api.anthropic.com/v1/messages",
-			APIKey:  apiKey,
-			Models:  []string{"claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-3-5-20250114"},
-		}
-	}
-
-	// Auto-detect GitHub Copilot
-	if apiKey := os.Getenv("GITHUB_TOKEN"); apiKey != "" {
-		providers["github"] = Provider{
-			Type:    ProviderGitHub,
-			BaseURL: "https://api.githubcopilot.com/chat/completions",
-			APIKey:  apiKey,
-			Models:  []string{"gpt-4o", "gpt-4", "gpt-3.5-turbo"},
-		}
-	}
-
-	// Auto-detect OpenAI
-	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
-		providers["openai"] = Provider{
-			Type:    ProviderOpenAI,
-			BaseURL: "https://api.openai.com/v1/chat/completions",
-			APIKey:  apiKey,
-			Models:  []string{"gpt-5", "gpt-oss-120b", "gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"},
-		}
-	}
-
 	// Auto-detect DigitalOcean Serverless Inference
 	if apiKey := os.Getenv("DO_SERVERLESS_INFERENCE"); apiKey != "" {
 		providers["digitalocean"] = Provider{
@@ -1792,7 +1384,58 @@ func autoDetectProviders() map[string]Provider {
 	return providers
 }
 
+// loadEnvFile loads environment variables from a .env file
+func loadEnvFile(filename string) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		// .env file is optional, so don't error if it doesn't exist
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		
+		// Split on first = to separate key from value
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		
+		// Remove quotes if present
+		if len(value) >= 2 {
+			if (strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"")) ||
+			   (strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'")) {
+				value = value[1 : len(value)-1]
+			}
+		}
+		
+		// Set the environment variable if it's not already set
+		if os.Getenv(key) == "" {
+			os.Setenv(key, value)
+		}
+	}
+	
+	return scanner.Err()
+}
+
 func loadConfig() (*Config, error) {
+	// Load .env file first
+	if err := loadEnvFile(".env"); err != nil {
+		fmt.Printf("Warning: Failed to load .env file: %v\n", err)
+	}
 	// Try to load existing config
 	configFile := "voyager-config.json"
 	config := &Config{
@@ -1825,13 +1468,9 @@ func loadConfig() (*Config, error) {
 
 	// Set defaults if not configured
 	if config.DefaultProvider == "" && len(config.Providers) > 0 {
-		// Prefer digitalocean, then github, then anthropic, then openai
+		// Use digitalocean as default
 		if _, exists := config.Providers["digitalocean"]; exists {
 			config.DefaultProvider = "digitalocean"
-		} else if _, exists := config.Providers["github"]; exists {
-			config.DefaultProvider = "github"
-		} else if _, exists := config.Providers["anthropic"]; exists {
-			config.DefaultProvider = "anthropic"
 		} else {
 			for name := range config.Providers {
 				config.DefaultProvider = name
@@ -1920,14 +1559,15 @@ func main() {
 
 			config := &Config{
 				Providers: map[string]Provider{
-					"ollama": {
-						Type:    ProviderOllama,
-						BaseURL: "http://localhost:11434",
-						Models:  []string{"llama3.2", "codellama", "mistral", "phi3", "qwen2.5-coder"},
+					"digitalocean": {
+						Type:    ProviderDigitalOcean,
+						BaseURL: "https://inference.do-ai.run/v1/chat/completions",
+						APIKey:  "${DO_SERVERLESS_INFERENCE}",
+						Models:  []string{"llama3.3-70b-instruct", "llama3.1-8b-instruct", "meta-llama/Llama-3.2-3B-Instruct"},
 					},
 				},
-				DefaultProvider: "ollama",
-				DefaultModel:    "llama3.2",
+				DefaultProvider: "digitalocean",
+				DefaultModel:    "llama3.3-70b-instruct",
 			}
 
 			if err := saveConfig(config); err != nil {
@@ -1936,10 +1576,8 @@ func main() {
 			}
 
 			fmt.Println("Voyager configuration initialized!")
-			fmt.Println("Edit voyager-config.json to add more providers:")
-			fmt.Println("   - OpenAI (GPT-4, GPT-3.5)")
-			fmt.Println("   - Anthropic (Claude)")
-			fmt.Println("   - Custom local endpoints")
+			fmt.Println("Set your DigitalOcean API key:")
+			fmt.Println("   export DO_SERVERLESS_INFERENCE=your-api-key")
 			fmt.Println()
 			fmt.Println("Run 'voyager chat' to start your AI journey!")
 		},
@@ -1959,46 +1597,14 @@ func main() {
 
 			providerName := args[0]
 			fmt.Printf("Adding provider: %s\n", providerName)
-			fmt.Println("📋 Example configurations:")
+			fmt.Println("📋 Example configuration:")
 			fmt.Println(`
-OpenAI:
-{
-  "type": "openai",
-  "base_url": "https://api.openai.com/v1/chat/completions",
-  "api_key": "your-api-key",
-  "models": ["gpt-oss-120b","gpt-4", "gpt-3.5-turbo", "gpt-4o"]
-}
-
-Anthropic:
-{
-  "type": "anthropic",
-  "base_url": "https://api.anthropic.com/v1/messages",
-  "api_key": "your-api-key",
-  "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514"]
-}
-
-DigitalOcean Gradient Platform:
+DigitalOcean Serverless Inference:
 {
   "type": "digitalocean",
   "base_url": "https://inference.do-ai.run/v1/chat/completions",
   "api_key": "your-model-access-key",
   "models": ["llama3.3-70b-instruct", "llama3.1-8b-instruct", "meta-llama/Llama-3.2-3B-Instruct"]
-}
-
-GitHub Copilot:
-{
-  "type": "github",
-  "base_url": "https://api.githubcopilot.com/chat/completions",
-  "api_key": "your-github-token",
-  "models": ["gpt-4o", "gpt-4", "gpt-3.5-turbo"]
-}
-
-Local/Custom:
-{
-  "type": "local",
-  "base_url": "http://localhost:8000/v1/chat/completions",
-  "api_key": "optional",
-  "models": ["your-model"]
 }`)
 
 			fmt.Printf("\n💡 Edit voyager-config.json to add the '%s' provider\n", providerName)
@@ -2024,7 +1630,7 @@ Local/Custom:
 
 			for name, provider := range config.Providers {
 				status := "OK"
-				if provider.Type != ProviderOllama && provider.APIKey == "" {
+				if provider.APIKey == "" {
 					status = "(no API key)"
 				}
 				fmt.Printf("  %s (%s) %s - %d models\n",
