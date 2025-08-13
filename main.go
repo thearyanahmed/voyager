@@ -846,8 +846,8 @@ func (m ChatModel) View() string {
 	// Chat area with border
 	chatArea := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#FF6B35")).
-		Padding(1, 2).
+		BorderForeground(lipgloss.Color("#F5F5DC")).
+		Padding(0).
 		Height(m.viewport.Height + 2).
 		Render(m.viewport.View())
 
