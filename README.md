@@ -80,6 +80,14 @@ Once running with Moondream, you can:
 
 ## Other Providers
 
+### GitHub Copilot
+```bash
+export GITHUB_TOKEN="your-github-token"
+./voyager chat
+```
+
+Note: You need a GitHub account with Copilot access. Get your token from GitHub Settings > Personal access tokens.
+
 ### Anthropic (Claude)
 ```bash
 export ANTHROPIC_API_KEY="your-api-key"
@@ -110,6 +118,7 @@ Edit `voyager-config.json` to add custom endpoints:
 ## Configuration
 
 Configuration is stored in `voyager-config.json`. Environment variables are auto-detected:
+- `GITHUB_TOKEN` - For GitHub Copilot models
 - `ANTHROPIC_API_KEY` - For Claude models
 - `OPENAI_API_KEY` - For GPT models
 

@@ -21,11 +21,12 @@ import (
 type ProviderType string
 
 const (
-	ProviderAnthropic ProviderType = "anthropic"
-	ProviderOpenAI    ProviderType = "openai"
-	ProviderOllama    ProviderType = "ollama"
-	ProviderLocal     ProviderType = "local"
-	ProviderGitHub    ProviderType = "github"
+	ProviderAnthropic     ProviderType = "anthropic"
+	ProviderOpenAI        ProviderType = "openai"
+	ProviderOllama        ProviderType = "ollama"
+	ProviderLocal         ProviderType = "local"
+	ProviderGitHub        ProviderType = "github"
+	ProviderDigitalOcean  ProviderType = "digitalocean"
 )
 
 // Provider configuration
@@ -425,6 +426,8 @@ func (m ChatModel) makeAPIRequest() (string, error) {
 		return m.sendLocalRequest(provider)
 	case ProviderGitHub:
 		return m.sendGitHubRequest(provider)
+	case ProviderDigitalOcean:
+		return m.sendDigitalOceanRequest(provider)
 	default:
 		return "", fmt.Errorf("unknown provider type: %s", provider.Type)
 	}
@@ -795,6 +798,81 @@ func (m ChatModel) sendGitHubRequest(provider Provider) (string, error) {
 	return apiResp.Choices[0].Message.Content, nil
 }
 
+func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
+	type DigitalOceanRequest struct {
+		Model       string    `json:"model"`
+		Messages    []Message `json:"messages"`
+		Temperature float64   `json:"temperature,omitempty"`
+		MaxTokens   int       `json:"max_tokens,omitempty"`
+	}
+
+	type DigitalOceanResponse struct {
+		Choices []struct {
+			Message Message `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+
+	// Convert messages to API format (without timestamp)
+	var apiMessages []Message
+	for _, msg := range m.conversation {
+		if msg.Role != "system" {
+			apiMessages = append(apiMessages, Message{
+				Role:    msg.Role,
+				Content: msg.Content,
+			})
+		}
+	}
+
+	request := DigitalOceanRequest{
+		Model:       m.currentModel,
+		Messages:    apiMessages,
+		Temperature: 0.7,
+		MaxTokens:   4000,
+	}
+
+	requestBody, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", provider.BaseURL, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var apiResp DigitalOceanResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if apiResp.Error != nil {
+		return "", fmt.Errorf("API error: %s", apiResp.Error.Message)
+	}
+
+	if len(apiResp.Choices) == 0 {
+		return "", fmt.Errorf("no choices in response")
+	}
+
+	return apiResp.Choices[0].Message.Content, nil
+}
+
 func (m *ChatModel) updateTextareaHeight() {
 	lines := strings.Count(m.textarea.Value(), "\n") + 1
 	if lines < 1 {
@@ -889,8 +967,15 @@ func autoDetectProviders() map[string]Provider {
 		}
 	}
 
-	// Note: GitHub Models API requires special access permissions
-	// Keeping the GitHub provider code for future when access is available
+	// Auto-detect GitHub Copilot
+	if apiKey := os.Getenv("GITHUB_TOKEN"); apiKey != "" {
+		providers["github"] = Provider{
+			Type:    ProviderGitHub,
+			BaseURL: "https://api.githubcopilot.com/chat/completions",
+			APIKey:  apiKey,
+			Models:  []string{"gpt-4o", "gpt-4", "gpt-3.5-turbo"},
+		}
+	}
 
 	// Auto-detect OpenAI
 	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
@@ -899,6 +984,16 @@ func autoDetectProviders() map[string]Provider {
 			BaseURL: "https://api.openai.com/v1/chat/completions",
 			APIKey:  apiKey,
 			Models:  []string{"gpt-5", "gpt-oss-120b", "gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"},
+		}
+	}
+
+	// Auto-detect DigitalOcean Serverless Inference
+	if apiKey := os.Getenv("DO_SERVERLESS_INFERENCE"); apiKey != "" {
+		providers["digitalocean"] = Provider{
+			Type:    ProviderDigitalOcean,
+			BaseURL: "https://inference.do-ai.run/v1/chat/completions",
+			APIKey:  apiKey,
+			Models:  []string{"llama3.3-70b-instruct", "llama3.1-8b-instruct", "meta-llama/Llama-3.2-3B-Instruct"},
 		}
 	}
 
@@ -937,11 +1032,13 @@ func loadConfig() (*Config, error) {
 
 	// Set defaults if not configured
 	if config.DefaultProvider == "" && len(config.Providers) > 0 {
-		// Prefer anthropic, then github, then openai
-		if _, exists := config.Providers["anthropic"]; exists {
-			config.DefaultProvider = "anthropic"
+		// Prefer digitalocean, then github, then anthropic, then openai
+		if _, exists := config.Providers["digitalocean"]; exists {
+			config.DefaultProvider = "digitalocean"
 		} else if _, exists := config.Providers["github"]; exists {
 			config.DefaultProvider = "github"
+		} else if _, exists := config.Providers["anthropic"]; exists {
+			config.DefaultProvider = "anthropic"
 		} else {
 			for name := range config.Providers {
 				config.DefaultProvider = name
@@ -957,7 +1054,7 @@ func loadConfig() (*Config, error) {
 	}
 
 	if len(config.Providers) == 0 {
-		return nil, fmt.Errorf("no providers available. Set ANTHROPIC_API_KEY, GITHUB_API_TOKEN, or OPENAI_API_KEY environment variables, or run 'voyager init'")
+		return nil, fmt.Errorf("no providers available. Set ANTHROPIC_API_KEY, GITHUB_TOKEN, or OPENAI_API_KEY environment variables, or run 'voyager init'")
 	}
 
 	return config, nil
@@ -1081,6 +1178,22 @@ Anthropic:
   "base_url": "https://api.anthropic.com/v1/messages",
   "api_key": "your-api-key",
   "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514"]
+}
+
+DigitalOcean Gradient Platform:
+{
+  "type": "digitalocean",
+  "base_url": "https://inference.do-ai.run/v1/chat/completions",
+  "api_key": "your-model-access-key",
+  "models": ["llama3.3-70b-instruct", "llama3.1-8b-instruct", "meta-llama/Llama-3.2-3B-Instruct"]
+}
+
+GitHub Copilot:
+{
+  "type": "github",
+  "base_url": "https://api.githubcopilot.com/chat/completions",
+  "api_key": "your-github-token",
+  "models": ["gpt-4o", "gpt-4", "gpt-3.5-turbo"]
 }
 
 Local/Custom:

@@ -1,5 +1,15 @@
 {
   "providers": {
+    "digitalocean": {
+      "type": "digitalocean",
+      "base_url": "https://inference.do-ai.run/v1/chat/completions",
+      "api_key": "${DO_SERVERLESS_INFERENCE}",
+      "models": [
+        "llama3.3-70b-instruct",
+        "llama3.1-8b-instruct",
+        "meta-llama/Llama-3.2-3B-Instruct"
+      ]
+    },
     "openai": {
       "type": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -22,6 +32,6 @@
       ]
     }
   },
-  "default_model": "moondream",
-  "default_provider": "ollama"
+  "default_model": "llama3.3-70b-instruct",
+  "default_provider": "digitalocean"
 }
