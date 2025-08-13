@@ -12,26 +12,33 @@
     },
     "openai": {
       "type": "openai",
-      "base_url": "https://api.openai.com/v1",
+      "base_url": "https://api.openai.com/v1/chat/completions",
       "api_key": "${OPENAI_API_KEY}",
       "models": [
+        "gpt-5",
         "gpt-oss-120b",
+        "gpt-4",
+        "gpt-4-turbo",
         "gpt-3.5-turbo"
-      ]
-    },
-    "ollama": {
-      "type": "ollama",
-      "base_url": "http://localhost:11434",
-      "models": [
-        "moondream",
-        "llama3.2",
-        "codellama",
-        "mistral",
-        "phi3:latest",
-        "qwen2.5-coder"
       ]
     }
   },
   "default_model": "llama3.3-70b-instruct",
-  "default_provider": "digitalocean"
+  "default_provider": "digitalocean",
+  "mcp_servers": {
+    "digitalocean": {
+      "name": "digitalocean",
+      "command": [
+        "npx",
+        "-y",
+        "@digitalocean/mcp",
+        "--services",
+        "apps,databases"
+      ],
+      "env": [
+        "DIGITALOCEAN_API_TOKEN=${DIGITALOCEAN_API_TOKEN}"
+      ],
+      "active": false
+    }
+  }
 }

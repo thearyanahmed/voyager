@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -39,9 +42,10 @@ type Provider struct {
 
 // Configuration
 type Config struct {
-	Providers       map[string]Provider `json:"providers"`
-	DefaultModel    string              `json:"default_model"`
-	DefaultProvider string              `json:"default_provider"`
+	Providers       map[string]Provider   `json:"providers"`
+	DefaultModel    string                `json:"default_model"`
+	DefaultProvider string                `json:"default_provider"`
+	MCPServers      map[string]MCPServer  `json:"mcp_servers,omitempty"`
 }
 
 // Message represents a chat message
@@ -49,6 +53,64 @@ type Message struct {
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
+}
+
+// MCP (Model Context Protocol) structures
+type MCPServer struct {
+	Name    string   `json:"name"`
+	Command []string `json:"command"`
+	Env     []string `json:"env,omitempty"`
+	Active  bool     `json:"active"`
+}
+
+type MCPTool struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description,omitempty"`
+	Schema      map[string]interface{} `json:"inputSchema,omitempty"`
+}
+
+type MCPResource struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	MimeType    string `json:"mimeType,omitempty"`
+}
+
+type MCPClient struct {
+	Server    *MCPServer
+	Process   *exec.Cmd
+	Stdin     io.WriteCloser
+	Stdout    *bufio.Scanner
+	Tools     []MCPTool
+	Resources []MCPResource
+	RequestID int
+	Mutex     sync.Mutex
+}
+
+// JSON-RPC structures for MCP
+type JSONRPCRequest struct {
+	JSONRPC string      `json:"jsonrpc"`
+	ID      int         `json:"id"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params,omitempty"`
+}
+
+type JSONRPCNotification struct {
+	JSONRPC string      `json:"jsonrpc"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params,omitempty"`
+}
+
+type JSONRPCResponse struct {
+	JSONRPC string                 `json:"jsonrpc"`
+	ID      int                    `json:"id,omitempty"`
+	Result  interface{}            `json:"result,omitempty"`
+	Error   *JSONRPCError         `json:"error,omitempty"`
+}
+
+type JSONRPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
 }
 
 // Styles for the TUI
@@ -116,6 +178,7 @@ type ChatModel struct {
 	height          int
 	err             error
 	spinnerIndex    int
+	mcpClients      map[string]*MCPClient
 }
 
 type responseMsg struct {
@@ -165,6 +228,7 @@ func initialModel(config *Config) ChatModel {
 		textarea:        ta,
 		viewport:        vp,
 		client:          &http.Client{Timeout: 120 * time.Second},
+		mcpClients:      make(map[string]*MCPClient),
 	}
 }
 
@@ -238,6 +302,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Handle commands
 			if strings.HasPrefix(userInput, "/") {
+				m.textarea.Reset() // Clear the textarea after command
 				return m.handleCommand(userInput[1:])
 			}
 
@@ -373,6 +438,11 @@ func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 /provider <name> - Switch provider
 /providers - List providers
 /models - List models for current provider
+/mcp start <server> - Start MCP server
+/mcp stop <server> - Stop MCP server
+/mcp list - List MCP servers
+/mcp tools - List available MCP tools
+/mcp call <tool> [args] - Call MCP tool
 /help - Show this help
 /quit - Exit voyager
 
@@ -388,6 +458,19 @@ Esc - Quit`
 		}
 		m.conversation = append(m.conversation, systemMsg)
 		m.updateViewport()
+
+	case "mcp":
+		if len(parts) < 2 {
+			systemMsg := Message{
+				Role:      "system",
+				Content:   "MCP commands: /mcp start <server>, /mcp stop <server>, /mcp list, /mcp tools, /mcp call <tool> [args...]",
+				Timestamp: time.Now(),
+			}
+			m.conversation = append(m.conversation, systemMsg)
+			m.updateViewport()
+		} else {
+			return m.handleMCPCommand(parts[1:])
+		}
 
 	case "quit", "exit":
 		return *m, tea.Quit
@@ -873,6 +956,517 @@ func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 	return apiResp.Choices[0].Message.Content, nil
 }
 
+// MCP Client methods
+func (m *ChatModel) handleMCPCommand(parts []string) (tea.Model, tea.Cmd) {
+	if len(parts) == 0 {
+		return *m, nil
+	}
+
+	switch parts[0] {
+	case "start":
+		if len(parts) < 2 {
+			systemMsg := Message{
+				Role:      "system",
+				Content:   "Usage: /mcp start <server-name>",
+				Timestamp: time.Now(),
+			}
+			m.conversation = append(m.conversation, systemMsg)
+		} else {
+			serverName := parts[1]
+			if err := m.startMCPServer(serverName); err != nil {
+				systemMsg := Message{
+					Role:      "system",
+					Content:   fmt.Sprintf("Failed to start MCP server '%s': %v", serverName, err),
+					Timestamp: time.Now(),
+				}
+				m.conversation = append(m.conversation, systemMsg)
+			} else {
+				systemMsg := Message{
+					Role:      "system",
+					Content:   fmt.Sprintf("Started MCP server '%s'", serverName),
+					Timestamp: time.Now(),
+				}
+				m.conversation = append(m.conversation, systemMsg)
+			}
+		}
+
+	case "stop":
+		if len(parts) < 2 {
+			systemMsg := Message{
+				Role:      "system",
+				Content:   "Usage: /mcp stop <server-name>",
+				Timestamp: time.Now(),
+			}
+			m.conversation = append(m.conversation, systemMsg)
+		} else {
+			serverName := parts[1]
+			if err := m.stopMCPServer(serverName); err != nil {
+				systemMsg := Message{
+					Role:      "system",
+					Content:   fmt.Sprintf("Failed to stop MCP server '%s': %v", serverName, err),
+					Timestamp: time.Now(),
+				}
+				m.conversation = append(m.conversation, systemMsg)
+			} else {
+				systemMsg := Message{
+					Role:      "system",
+					Content:   fmt.Sprintf("Stopped MCP server '%s'", serverName),
+					Timestamp: time.Now(),
+				}
+				m.conversation = append(m.conversation, systemMsg)
+			}
+		}
+
+	case "list":
+		var serverList []string
+		for name, server := range m.config.MCPServers {
+			status := "inactive"
+			if _, active := m.mcpClients[name]; active {
+				status = "active"
+			}
+			serverList = append(serverList, fmt.Sprintf("  %s (%s) - %s", name, server.Name, status))
+		}
+		
+		content := "MCP Servers:\n" + strings.Join(serverList, "\n")
+		if len(serverList) == 0 {
+			content = "No MCP servers configured"
+		}
+		
+		systemMsg := Message{
+			Role:      "system",
+			Content:   content,
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, systemMsg)
+
+	case "tools":
+		tools := m.listMCPTools()
+		var toolList []string
+		for _, tool := range tools {
+			desc := tool.Description
+			if desc == "" {
+				desc = "No description"
+			}
+			toolList = append(toolList, fmt.Sprintf("  %s - %s", tool.Name, desc))
+		}
+		
+		content := "Available MCP Tools:\n" + strings.Join(toolList, "\n")
+		if len(toolList) == 0 {
+			content = "No MCP tools available (start an MCP server first)"
+		}
+		
+		systemMsg := Message{
+			Role:      "system",
+			Content:   content,
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, systemMsg)
+
+	case "call":
+		if len(parts) < 2 {
+			systemMsg := Message{
+				Role:      "system",
+				Content:   "Usage: /mcp call <tool-name> [arguments-as-json]",
+				Timestamp: time.Now(),
+			}
+			m.conversation = append(m.conversation, systemMsg)
+		} else {
+			toolName := parts[1]
+			var arguments map[string]interface{}
+			
+			if len(parts) > 2 {
+				jsonArg := strings.Join(parts[2:], " ")
+				if err := json.Unmarshal([]byte(jsonArg), &arguments); err != nil {
+					systemMsg := Message{
+						Role:      "system",
+						Content:   fmt.Sprintf("Failed to parse arguments: %v", err),
+						Timestamp: time.Now(),
+					}
+					m.conversation = append(m.conversation, systemMsg)
+					break
+				}
+			}
+
+			client := m.getMCPClientForTool(toolName)
+			if client == nil {
+				systemMsg := Message{
+					Role:      "system",
+					Content:   fmt.Sprintf("Tool '%s' not found in any active MCP server", toolName),
+					Timestamp: time.Now(),
+				}
+				m.conversation = append(m.conversation, systemMsg)
+			} else {
+				result, err := client.callTool(toolName, arguments)
+				if err != nil {
+					systemMsg := Message{
+						Role:      "system",
+						Content:   fmt.Sprintf("Failed to call tool '%s': %v", toolName, err),
+						Timestamp: time.Now(),
+					}
+					m.conversation = append(m.conversation, systemMsg)
+				} else {
+					resultJSON, _ := json.MarshalIndent(result, "", "  ")
+					systemMsg := Message{
+						Role:      "system",
+						Content:   fmt.Sprintf("Tool '%s' result:\n%s", toolName, string(resultJSON)),
+						Timestamp: time.Now(),
+					}
+					m.conversation = append(m.conversation, systemMsg)
+				}
+			}
+		}
+
+	default:
+		systemMsg := Message{
+			Role:      "system",
+			Content:   fmt.Sprintf("Unknown MCP command: %s", parts[0]),
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, systemMsg)
+	}
+
+	m.updateViewport()
+	return *m, nil
+}
+
+func (m *ChatModel) startMCPServer(serverName string) error {
+	server, exists := m.config.MCPServers[serverName]
+	if !exists {
+		return fmt.Errorf("MCP server '%s' not found in configuration", serverName)
+	}
+
+	if len(server.Command) == 0 {
+		return fmt.Errorf("MCP server '%s' has no command configured", serverName)
+	}
+
+	// Start MCP server in background to avoid blocking TUI
+	go func() {
+		// Expand environment variables in command arguments
+		expandedCommand := make([]string, len(server.Command))
+		for i, arg := range server.Command {
+			expandedCommand[i] = os.ExpandEnv(arg)
+		}
+
+		// Expand environment variables in server.Env
+		expandedEnv := make([]string, len(server.Env))
+		for i, envVar := range server.Env {
+			expandedEnv[i] = expandMCPEnvVar(envVar)
+		}
+
+		// Start the MCP server process
+		cmd := exec.Command(expandedCommand[0], expandedCommand[1:]...)
+		cmd.Env = append(os.Environ(), expandedEnv...)
+		
+		// Debug: log the command being executed
+		fmt.Printf("DEBUG: Starting MCP server with command: %v\n", expandedCommand)
+		fmt.Printf("DEBUG: Environment: %v\n", expandedEnv)
+		
+		// Capture stderr for debugging
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		// Keep current working directory for environment access
+		// cmd.Dir = os.TempDir() // Run in temp directory
+		
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return
+		}
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return
+		}
+
+		if err := cmd.Start(); err != nil {
+			fmt.Printf("DEBUG: Failed to start MCP server: %v\n", err)
+			return
+		}
+
+		scanner := bufio.NewScanner(stdout)
+		// Increase buffer size to handle large MCP responses (default is 64KB, set to 1MB)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+		
+		client := &MCPClient{
+			Server:    &server,
+			Process:   cmd,
+			Stdin:     stdin,
+			Stdout:    scanner,
+			RequestID: 1,
+		}
+
+		m.mcpClients[serverName] = client
+
+		// Give server time to start
+		time.Sleep(1 * time.Second)
+		
+		// Try to initialize
+		if err := client.initialize(); err != nil {
+			fmt.Printf("DEBUG: Failed to initialize MCP server: %v\n", err)
+			fmt.Printf("DEBUG: Server stderr: %s\n", stderr.String())
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+			}
+			delete(m.mcpClients, serverName)
+			return
+		}
+
+		// Try to discover capabilities
+		client.discoverCapabilities()
+		
+		// Mark as active
+		if server, exists := m.config.MCPServers[serverName]; exists {
+			server.Active = true
+			m.config.MCPServers[serverName] = server
+		}
+	}()
+	
+	return nil
+}
+
+func (m *ChatModel) stopMCPServer(serverName string) error {
+	client, exists := m.mcpClients[serverName]
+	if !exists {
+		return fmt.Errorf("MCP server '%s' is not running", serverName)
+	}
+
+	if client.Process != nil && client.Process.Process != nil {
+		client.Process.Process.Kill()
+		client.Process.Wait()
+	}
+
+	delete(m.mcpClients, serverName)
+	
+	if server, exists := m.config.MCPServers[serverName]; exists {
+		server.Active = false
+		m.config.MCPServers[serverName] = server
+	}
+
+	return nil
+}
+
+func (client *MCPClient) sendRequest(method string, params interface{}) (*JSONRPCResponse, error) {
+	client.Mutex.Lock()
+	defer client.Mutex.Unlock()
+
+	request := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      client.RequestID,
+		Method:  method,
+		Params:  params,
+	}
+	client.RequestID++
+
+	data, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Send request
+	fmt.Printf("DEBUG: Sending MCP request: %s\n", string(data))
+	if _, err := client.Stdin.Write(append(data, '\n')); err != nil {
+		return nil, fmt.Errorf("failed to write request: %w", err)
+	}
+
+	// Read response with very short timeout to prevent hanging
+	responseChan := make(chan JSONRPCResponse, 1)
+	errorChan := make(chan error, 1)
+	
+	go func() {
+		if client.Stdout.Scan() {
+			responseData := client.Stdout.Bytes()
+			// Truncate debug output if response is too long
+			debugOutput := string(responseData)
+			if len(debugOutput) > 500 {
+				debugOutput = debugOutput[:500] + "... [truncated]"
+			}
+			fmt.Printf("DEBUG: Received MCP response (%d bytes): %s\n", len(responseData), debugOutput)
+			
+			var response JSONRPCResponse
+			if err := json.Unmarshal(responseData, &response); err != nil {
+				fmt.Printf("DEBUG: Failed to unmarshal response: %v\n", err)
+				fmt.Printf("DEBUG: Response data length: %d bytes\n", len(responseData))
+				errorChan <- fmt.Errorf("failed to unmarshal response: %w", err)
+			} else {
+				responseChan <- response
+			}
+		} else {
+			fmt.Printf("DEBUG: Failed to scan stdout from MCP server\n")
+			if err := client.Stdout.Err(); err != nil {
+				fmt.Printf("DEBUG: Scanner error: %v\n", err)
+			}
+			errorChan <- fmt.Errorf("failed to read response")
+		}
+	}()
+
+	select {
+	case response := <-responseChan:
+		if response.Error != nil {
+			return nil, fmt.Errorf("MCP error: %s", response.Error.Message)
+		}
+		return &response, nil
+	case err := <-errorChan:
+		return nil, err
+	case <-time.After(2 * time.Second):
+		return nil, fmt.Errorf("timeout waiting for response")
+	}
+}
+
+func (client *MCPClient) initialize() error {
+	params := map[string]interface{}{
+		"protocolVersion": "2025-06-18",
+		"capabilities": map[string]interface{}{
+			"sampling": map[string]interface{}{},
+		},
+		"clientInfo": map[string]interface{}{
+			"name":    "voyager",
+			"version": "1.0.0",
+		},
+	}
+
+	_, err := client.sendRequest("initialize", params)
+	if err != nil {
+		return err
+	}
+
+	// Send initialized notification (no ID for notifications)
+	notification := JSONRPCNotification{
+		JSONRPC: "2.0",
+		Method:  "notifications/initialized",
+	}
+
+	data, _ := json.Marshal(notification)
+	client.Stdin.Write(append(data, '\n'))
+
+	return nil
+}
+
+func (client *MCPClient) discoverCapabilities() error {
+	// Discover tools
+	if response, err := client.sendRequest("tools/list", nil); err == nil {
+		if result, ok := response.Result.(map[string]interface{}); ok {
+			if tools, ok := result["tools"].([]interface{}); ok {
+				for _, toolData := range tools {
+					if toolMap, ok := toolData.(map[string]interface{}); ok {
+						// Safely get the tool name
+						if nameVal, ok := toolMap["name"].(string); ok {
+							tool := MCPTool{
+								Name: nameVal,
+							}
+							if desc, ok := toolMap["description"].(string); ok {
+								tool.Description = desc
+							}
+							if schema, ok := toolMap["inputSchema"].(map[string]interface{}); ok {
+								tool.Schema = schema
+							}
+							client.Tools = append(client.Tools, tool)
+						}
+					}
+				}
+			}
+		}
+	} else {
+		// Log the error for debugging
+		fmt.Printf("DEBUG: Failed to list tools: %v\n", err)
+	}
+
+	// Discover resources
+	if response, err := client.sendRequest("resources/list", nil); err == nil {
+		if result, ok := response.Result.(map[string]interface{}); ok {
+			if resources, ok := result["resources"].([]interface{}); ok {
+				for _, resourceData := range resources {
+					if resourceMap, ok := resourceData.(map[string]interface{}); ok {
+						// Safely get the resource URI
+						if uriVal, ok := resourceMap["uri"].(string); ok {
+							resource := MCPResource{
+								URI: uriVal,
+							}
+							if name, ok := resourceMap["name"].(string); ok {
+								resource.Name = name
+							}
+							if desc, ok := resourceMap["description"].(string); ok {
+								resource.Description = desc
+							}
+							client.Resources = append(client.Resources, resource)
+						}
+					}
+				}
+			}
+		}
+	} else {
+		// Log the error for debugging
+		fmt.Printf("DEBUG: Failed to list resources: %v\n", err)
+	}
+
+	return nil
+}
+
+func (client *MCPClient) callTool(name string, arguments map[string]interface{}) (interface{}, error) {
+	params := map[string]interface{}{
+		"name":      name,
+		"arguments": arguments,
+	}
+
+	response, err := client.sendRequest("tools/call", params)
+	if err != nil {
+		return nil, err
+	}
+
+	return response.Result, nil
+}
+
+func (m *ChatModel) listMCPTools() []MCPTool {
+	var allTools []MCPTool
+	for _, client := range m.mcpClients {
+		allTools = append(allTools, client.Tools...)
+	}
+	return allTools
+}
+
+func (m *ChatModel) getMCPClientForTool(toolName string) *MCPClient {
+	for _, client := range m.mcpClients {
+		for _, tool := range client.Tools {
+			if tool.Name == toolName {
+				return client
+			}
+		}
+	}
+	return nil
+}
+
+// expandMCPEnvVar expands environment variables in MCP server env values
+// If the value starts with ${ and ends with }, it looks up the environment variable
+// Otherwise, it returns the value as-is
+func expandMCPEnvVar(envVar string) string {
+	// Split on = to separate key from value
+	parts := strings.SplitN(envVar, "=", 2)
+	if len(parts) != 2 {
+		fmt.Printf("DEBUG: Invalid env var format (no =): %s\n", envVar)
+		return envVar // Return as-is if not in KEY=VALUE format
+	}
+	
+	key := parts[0]
+	value := parts[1]
+	
+	// Check if value starts with ${ and ends with }
+	if strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") {
+		// Extract the environment variable name
+		envName := strings.TrimSuffix(strings.TrimPrefix(value, "${"), "}")
+		// Look up the environment variable
+		envValue := os.Getenv(envName)
+		debugValue := envValue
+		if len(debugValue) > 20 {
+			debugValue = debugValue[:20] + "..."
+		}
+		fmt.Printf("DEBUG: Expanding ${%s} -> '%s' (length: %d)\n", envName, debugValue, len(envValue))
+		return key + "=" + envValue
+	}
+	
+	// Return as-is if not in ${...} format
+	fmt.Printf("DEBUG: Not expanding env var (no ${} pattern): %s\n", envVar)
+	return envVar
+}
+
 func (m *ChatModel) updateTextareaHeight() {
 	lines := strings.Count(m.textarea.Value(), "\n") + 1
 	if lines < 1 {
@@ -1004,7 +1598,8 @@ func loadConfig() (*Config, error) {
 	// Try to load existing config
 	configFile := "voyager-config.json"
 	config := &Config{
-		Providers: make(map[string]Provider),
+		Providers:  make(map[string]Provider),
+		MCPServers: make(map[string]MCPServer),
 	}
 
 	if data, err := os.ReadFile(configFile); err == nil {
@@ -1053,8 +1648,10 @@ func loadConfig() (*Config, error) {
 		}
 	}
 
+	// Only require providers for chat functionality, not for MCP management
 	if len(config.Providers) == 0 {
-		return nil, fmt.Errorf("no providers available. Set ANTHROPIC_API_KEY, GITHUB_TOKEN, or OPENAI_API_KEY environment variables, or run 'voyager init'")
+		// Allow empty providers for MCP-only operations
+		return config, nil
 	}
 
 	return config, nil
@@ -1236,7 +1833,162 @@ Local/Custom:
 		},
 	}
 
-	rootCmd.AddCommand(chatCmd, initCmd, addCmd, statusCmd)
+	// MCP command
+	mcpCmd := &cobra.Command{
+		Use:   "mcp",
+		Short: "Manage MCP servers",
+		Long:  "Add, remove, list, and manage Model Context Protocol servers",
+	}
+
+	mcpAddCmd := &cobra.Command{
+		Use:   "add <name> [flags] -- <command>...",
+		Short: "Add a new MCP server",
+		Long: `Add a new MCP server to voyager configuration.
+
+Examples:
+  voyager mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
+  voyager mcp add digitalocean -e DIGITALOCEAN_API_TOKEN=dop_xxx -- npx -y @digitalocean/mcp --services apps,droplets
+  voyager mcp add sqlite -- npx -y @modelcontextprotocol/server-sqlite --db-path ./data.db`,
+		Args: cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			// Get all args including those after --
+			allArgs := os.Args[3:] // Skip "voyager mcp add"
+			
+			// Find the position of "--"
+			dashIndex := -1
+			for i, arg := range allArgs {
+				if arg == "--" {
+					dashIndex = i
+					break
+				}
+			}
+			
+			if dashIndex == -1 {
+				fmt.Println("Error: Command must be specified after '--'")
+				fmt.Println("Example: voyager mcp add myserver -- npx server-command")
+				return
+			}
+
+			serverName := allArgs[0]
+			command := allArgs[dashIndex+1:]
+			
+			envVars, _ := cmd.Flags().GetStringArray("env")
+			
+			config, err := loadConfig()
+			if err != nil {
+				fmt.Printf("Error loading config: %v\n", err)
+				return
+			}
+
+			if config.MCPServers == nil {
+				config.MCPServers = make(map[string]MCPServer)
+			}
+
+			config.MCPServers[serverName] = MCPServer{
+				Name:    serverName,
+				Command: command,
+				Env:     envVars,
+				Active:  false,
+			}
+
+			if err := saveConfig(config); err != nil {
+				fmt.Printf("Error saving config: %v\n", err)
+				return
+			}
+
+			fmt.Printf("✅ Added MCP server '%s'\n", serverName)
+			fmt.Printf("Command: %v\n", command)
+			if len(envVars) > 0 {
+				fmt.Printf("Environment: %v\n", envVars)
+			}
+			fmt.Printf("Start it with: voyager mcp start %s\n", serverName)
+		},
+	}
+	mcpAddCmd.Flags().StringArrayP("env", "e", []string{}, "Environment variables (KEY=value)")
+
+	mcpRemoveCmd := &cobra.Command{
+		Use:     "remove <name>",
+		Aliases: []string{"rm"},
+		Short:   "Remove an MCP server",
+		Args:    cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			serverName := args[0]
+			config, err := loadConfig()
+			if err != nil {
+				fmt.Printf("Error loading config: %v\n", err)
+				return
+			}
+
+			if _, exists := config.MCPServers[serverName]; !exists {
+				fmt.Printf("❌ MCP server '%s' not found\n", serverName)
+				return
+			}
+
+			delete(config.MCPServers, serverName)
+
+			if err := saveConfig(config); err != nil {
+				fmt.Printf("Error saving config: %v\n", err)
+				return
+			}
+
+			fmt.Printf("✅ Removed MCP server '%s'\n", serverName)
+		},
+	}
+
+	mcpListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List all MCP servers",
+		Run: func(cmd *cobra.Command, args []string) {
+			config, err := loadConfig()
+			if err != nil {
+				fmt.Printf("Error loading config: %v\n", err)
+				return
+			}
+
+			if len(config.MCPServers) == 0 {
+				fmt.Println("No MCP servers configured")
+				return
+			}
+
+			fmt.Println("Configured MCP servers:")
+			for name, server := range config.MCPServers {
+				status := "inactive"
+				if server.Active {
+					status = "active"
+				}
+				fmt.Printf("  %s (%s) - %s\n", name, server.Name, status)
+				fmt.Printf("    Command: %v\n", server.Command)
+				if len(server.Env) > 0 {
+					fmt.Printf("    Environment: %v\n", server.Env)
+				}
+			}
+		},
+	}
+
+	mcpStartCmd := &cobra.Command{
+		Use:   "start <name>",
+		Short: "Start an MCP server",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			serverName := args[0]
+			fmt.Printf("Starting MCP server '%s'...\n", serverName)
+			fmt.Println("Note: Use 'voyager chat' and '/mcp start' for interactive management")
+		},
+	}
+
+	mcpStopCmd := &cobra.Command{
+		Use:   "stop <name>",
+		Short: "Stop an MCP server",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			serverName := args[0]
+			fmt.Printf("Note: MCP server management is available in 'voyager chat' with '/mcp stop %s'\n", serverName)
+		},
+	}
+
+	mcpCmd.AddCommand(mcpAddCmd, mcpRemoveCmd, mcpListCmd, mcpStartCmd, mcpStopCmd)
+
+	rootCmd.AddCommand(chatCmd, initCmd, addCmd, statusCmd, mcpCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Printf("Error: %v\n", err)
