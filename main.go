@@ -967,6 +967,23 @@ func main() {
 		Use:   "voyager",
 		Short: "🚀 Voyager - Multi-provider AI CLI with beautiful TUI",
 		Long:  "Voyager is an interactive TUI for chatting with multiple AI providers: OpenAI, Anthropic, Ollama, and local models.",
+		Run: func(cmd *cobra.Command, args []string) {
+			// Default to chat command when no subcommand provided
+			config, err := loadConfig()
+			if err != nil {
+				fmt.Printf("❌ Error loading config: %v\n", err)
+				fmt.Println("💡 Run 'voyager init' to set up configuration")
+				return
+			}
+
+			model := initialModel(config)
+			p := tea.NewProgram(model, tea.WithAltScreen())
+
+			if _, err := p.Run(); err != nil {
+				fmt.Printf("❌ Error running program: %v\n", err)
+				os.Exit(1)
+			}
+		},
 	}
 
 	// Chat command with TUI
