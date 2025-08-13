@@ -25,6 +25,7 @@ const (
 	ProviderOpenAI    ProviderType = "openai"
 	ProviderOllama    ProviderType = "ollama"
 	ProviderLocal     ProviderType = "local"
+	ProviderGitHub    ProviderType = "github"
 )
 
 // Provider configuration
@@ -176,7 +177,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		
+
 		headerHeight := 5
 		footerHeight := 8
 		verticalMarginHeight := headerHeight + footerHeight
@@ -196,18 +197,18 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			return m, tea.Quit
-			
+
 		case tea.KeyEsc:
 			if m.loading {
 				return m, nil // Don't quit while loading
 			}
 			return m, tea.Quit
-			
+
 		case tea.KeyEnter:
 			if m.loading {
 				break
 			}
-			
+
 			userInput := strings.TrimSpace(m.textarea.Value())
 			if userInput == "" {
 				break
@@ -238,7 +239,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 		} else {
 			assistantMsg := Message{
-				Role:      "assistant", 
+				Role:      "assistant",
 				Content:   msg.content,
 				Timestamp: time.Now(),
 			}
@@ -262,7 +263,7 @@ func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 		m.conversation = []Message{}
 		m.err = nil
 		m.updateViewport()
-		
+
 	case "model":
 		if len(parts) > 1 {
 			m.currentModel = parts[1]
@@ -282,7 +283,7 @@ func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 			m.conversation = append(m.conversation, systemMsg)
 			m.updateViewport()
 		}
-		
+
 	case "provider":
 		if len(parts) > 1 {
 			if _, exists := m.config.Providers[parts[1]]; exists {
@@ -315,7 +316,7 @@ func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 			m.conversation = append(m.conversation, systemMsg)
 			m.updateViewport()
 		}
-		
+
 	case "providers":
 		var providers []string
 		for name := range m.config.Providers {
@@ -328,7 +329,7 @@ func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 		}
 		m.conversation = append(m.conversation, systemMsg)
 		m.updateViewport()
-		
+
 	case "models":
 		if provider, exists := m.config.Providers[m.currentProvider]; exists {
 			systemMsg := Message{
@@ -339,12 +340,12 @@ func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 			m.conversation = append(m.conversation, systemMsg)
 			m.updateViewport()
 		}
-		
+
 	case "help":
 		helpText := `Available commands:
 /clear - Clear conversation
 /model <name> - Switch model
-/provider <name> - Switch provider  
+/provider <name> - Switch provider
 /providers - List providers
 /models - List models for current provider
 /help - Show this help
@@ -354,7 +355,7 @@ Controls:
 Enter - Send message
 Ctrl+C - Quit
 Esc - Quit`
-		
+
 		systemMsg := Message{
 			Role:      "system",
 			Content:   helpText,
@@ -362,10 +363,10 @@ Esc - Quit`
 		}
 		m.conversation = append(m.conversation, systemMsg)
 		m.updateViewport()
-		
+
 	case "quit", "exit":
 		return *m, tea.Quit
-		
+
 	default:
 		systemMsg := Message{
 			Role:      "system",
@@ -388,7 +389,7 @@ func (m ChatModel) sendMessage() tea.Cmd {
 
 func (m ChatModel) makeAPIRequest() (string, error) {
 	provider := m.config.Providers[m.currentProvider]
-	
+
 	switch provider.Type {
 	case ProviderOpenAI:
 		return m.sendOpenAIRequest(provider)
@@ -398,6 +399,8 @@ func (m ChatModel) makeAPIRequest() (string, error) {
 		return m.sendOllamaRequest(provider)
 	case ProviderLocal:
 		return m.sendLocalRequest(provider)
+	case ProviderGitHub:
+		return m.sendGitHubRequest(provider)
 	default:
 		return "", fmt.Errorf("unknown provider type: %s", provider.Type)
 	}
@@ -448,6 +451,12 @@ func (m ChatModel) sendOpenAIRequest(provider Provider) (string, error) {
 
 	req.Header.Set("Content-Type", "application/json")
 	if provider.APIKey != "" {
+		// Debug: print first and last few characters of API key
+		keyLen := len(provider.APIKey)
+		if keyLen > 10 {
+			fmt.Printf("Debug: Using API key: %s...%s (length: %d)\n",
+				provider.APIKey[:4], provider.APIKey[keyLen-4:], keyLen)
+		}
 		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
 	}
 
@@ -588,6 +597,10 @@ func (m ChatModel) sendOllamaRequest(provider Provider) (string, error) {
 	}
 
 	url := provider.BaseURL + "/api/chat"
+	fmt.Printf("Debug: Ollama URL: %s\n", url)
+	fmt.Printf("Debug: Model: %s\n", m.currentModel)
+	fmt.Printf("Debug: Request: %s\n", string(requestBody))
+	
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
@@ -605,6 +618,8 @@ func (m ChatModel) sendOllamaRequest(provider Provider) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
+
+	fmt.Printf("Debug: Response: %s\n", string(body))
 
 	var apiResp OllamaResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
@@ -683,25 +698,112 @@ func (m ChatModel) sendLocalRequest(provider Provider) (string, error) {
 	return string(body), nil
 }
 
+func (m ChatModel) sendGitHubRequest(provider Provider) (string, error) {
+	type GitHubRequest struct {
+		Model     string    `json:"model"`
+		Messages  []Message `json:"messages"`
+		MaxTokens int       `json:"max_tokens,omitempty"`
+	}
+
+	type GitHubResponse struct {
+		Choices []struct {
+			Message Message `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+
+	// Convert messages to API format (without timestamp)
+	var apiMessages []Message
+	for _, msg := range m.conversation {
+		if msg.Role != "system" {
+			apiMessages = append(apiMessages, Message{
+				Role:    msg.Role,
+				Content: msg.Content,
+			})
+		}
+	}
+
+	request := GitHubRequest{
+		Model:     m.currentModel,
+		Messages:  apiMessages,
+		MaxTokens: 4000,
+	}
+
+	requestBody, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", provider.BaseURL, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	req.Header.Set("User-Agent", "Voyager/1.0")
+
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Debug: print response body
+	fmt.Printf("GitHub API Response: %s\n", string(body))
+
+	var apiResp GitHubResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		// Try to parse as generic response
+		var genericResp map[string]interface{}
+		if err2 := json.Unmarshal(body, &genericResp); err2 == nil {
+			if content, ok := genericResp["content"].(string); ok {
+				return content, nil
+			}
+			if message, ok := genericResp["message"].(string); ok {
+				return message, nil
+			}
+		}
+		return "", fmt.Errorf("failed to parse response: %w\nResponse: %s", err, string(body))
+	}
+
+	if apiResp.Error != nil {
+		return "", fmt.Errorf("API error: %s", apiResp.Error.Message)
+	}
+
+	if len(apiResp.Choices) == 0 {
+		return "", fmt.Errorf("no choices in response")
+	}
+
+	return apiResp.Choices[0].Message.Content, nil
+}
+
 func (m *ChatModel) updateViewport() {
 	var content strings.Builder
-	
+
 	for _, msg := range m.conversation {
 		timestamp := msg.Timestamp.Format("15:04")
-		
+
 		switch msg.Role {
 		case "user":
 			content.WriteString(userMsgStyle.Render(fmt.Sprintf("🚀 You (%s)", timestamp)))
 			content.WriteString("\n")
 			content.WriteString(msgContentStyle.Render(msg.Content))
 			content.WriteString("\n\n")
-			
+
 		case "assistant":
 			content.WriteString(assistantMsgStyle.Render(fmt.Sprintf("🤖 AI (%s)", timestamp)))
 			content.WriteString("\n")
 			content.WriteString(msgContentStyle.Render(msg.Content))
 			content.WriteString("\n\n")
-			
+
 		case "system":
 			content.WriteString(systemMsgStyle.Render(fmt.Sprintf("⚙️  System (%s)", timestamp)))
 			content.WriteString("\n")
@@ -733,9 +835,9 @@ func (m ChatModel) View() string {
 
 	// Header with voyager branding
 	title := titleStyle.Render(fmt.Sprintf(" 🚀 VOYAGER - %s/%s ", m.currentProvider, m.currentModel))
-	
+
 	// Status line
-	status := statusStyle.Render(fmt.Sprintf("🌐 Provider: %s | 🤖 Model: %s | 💬 Messages: %d", 
+	status := statusStyle.Render(fmt.Sprintf("🌐 Provider: %s | 🤖 Model: %s | 💬 Messages: %d",
 		m.currentProvider, m.currentModel, len(m.conversation)))
 
 	// Help
@@ -765,15 +867,91 @@ func (m ChatModel) View() string {
 }
 
 // Configuration functions
-func loadConfig() (*Config, error) {
-	configFile := "voyager-config.json"
-	data, err := os.ReadFile(configFile)
-	if err != nil {
-		return nil, fmt.Errorf("config file not found. Run 'voyager init' first")
+func autoDetectProviders() map[string]Provider {
+	providers := make(map[string]Provider)
+
+	// Auto-detect Anthropic
+	if apiKey := os.Getenv("ANTHROPIC_API_KEY"); apiKey != "" {
+		providers["anthropic"] = Provider{
+			Type:    ProviderAnthropic,
+			BaseURL: "https://api.anthropic.com/v1/messages",
+			APIKey:  apiKey,
+			Models:  []string{"claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-3-5-20250114"},
+		}
 	}
 
-	config := &Config{}
-	return config, json.Unmarshal(data, config)
+	// Note: GitHub Models API requires special access permissions
+	// Keeping the GitHub provider code for future when access is available
+
+	// Auto-detect OpenAI
+	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
+		providers["openai"] = Provider{
+			Type:    ProviderOpenAI,
+			BaseURL: "https://api.openai.com/v1/chat/completions",
+			APIKey:  apiKey,
+			Models:  []string{"gpt-5", "gpt-oss-120b", "gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"},
+		}
+	}
+
+	return providers
+}
+
+func loadConfig() (*Config, error) {
+	// Try to load existing config
+	configFile := "voyager-config.json"
+	config := &Config{
+		Providers: make(map[string]Provider),
+	}
+
+	if data, err := os.ReadFile(configFile); err == nil {
+		json.Unmarshal(data, config)
+
+		// Expand environment variables in API keys
+		for name, provider := range config.Providers {
+			if strings.HasPrefix(provider.APIKey, "${") && strings.HasSuffix(provider.APIKey, "}") {
+				envVar := provider.APIKey[2 : len(provider.APIKey)-1] // Remove ${ and }
+				if envValue := os.Getenv(envVar); envValue != "" {
+					provider.APIKey = envValue
+					config.Providers[name] = provider
+				}
+			}
+		}
+	}
+
+	// Auto-detect providers from environment variables
+	autoProviders := autoDetectProviders()
+
+	// Merge auto-detected providers with existing config
+	for name, provider := range autoProviders {
+		config.Providers[name] = provider
+	}
+
+	// Set defaults if not configured
+	if config.DefaultProvider == "" && len(config.Providers) > 0 {
+		// Prefer anthropic, then github, then openai
+		if _, exists := config.Providers["anthropic"]; exists {
+			config.DefaultProvider = "anthropic"
+		} else if _, exists := config.Providers["github"]; exists {
+			config.DefaultProvider = "github"
+		} else {
+			for name := range config.Providers {
+				config.DefaultProvider = name
+				break
+			}
+		}
+	}
+
+	if config.DefaultModel == "" && config.DefaultProvider != "" {
+		if provider, exists := config.Providers[config.DefaultProvider]; exists && len(provider.Models) > 0 {
+			config.DefaultModel = provider.Models[0]
+		}
+	}
+
+	if len(config.Providers) == 0 {
+		return nil, fmt.Errorf("no providers available. Set ANTHROPIC_API_KEY, GITHUB_API_TOKEN, or OPENAI_API_KEY environment variables, or run 'voyager init'")
+	}
+
+	return config, nil
 }
 
 func saveConfig(config *Config) error {
@@ -819,7 +997,7 @@ func main() {
 		Short: "⚙️  Initialize Voyager configuration",
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Println("🚀 Initializing Voyager...")
-			
+
 			config := &Config{
 				Providers: map[string]Provider{
 					"ollama": {
@@ -866,16 +1044,16 @@ func main() {
 OpenAI:
 {
   "type": "openai",
-  "base_url": "https://api.openai.com/v1/chat/completions", 
+  "base_url": "https://api.openai.com/v1/chat/completions",
   "api_key": "your-api-key",
-  "models": ["gpt-4", "gpt-3.5-turbo", "gpt-4o"]
+  "models": ["gpt-oss-120b","gpt-4", "gpt-3.5-turbo", "gpt-4o"]
 }
 
 Anthropic:
 {
   "type": "anthropic",
   "base_url": "https://api.anthropic.com/v1/messages",
-  "api_key": "your-api-key", 
+  "api_key": "your-api-key",
   "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514"]
 }
 
@@ -886,7 +1064,7 @@ Local/Custom:
   "api_key": "optional",
   "models": ["your-model"]
 }`)
-			
+
 			fmt.Printf("\n💡 Edit voyager-config.json to add the '%s' provider\n", providerName)
 		},
 	}
@@ -907,13 +1085,13 @@ Local/Custom:
 			fmt.Printf("🔧 Default provider: %s\n", config.DefaultProvider)
 			fmt.Printf("🤖 Default model: %s\n", config.DefaultModel)
 			fmt.Println("\n📡 Configured providers:")
-			
+
 			for name, provider := range config.Providers {
 				status := "✅"
 				if provider.Type != ProviderOllama && provider.APIKey == "" {
 					status = "⚠️  (no API key)"
 				}
-				fmt.Printf("  • %s (%s) %s - %d models\n", 
+				fmt.Printf("  • %s (%s) %s - %d models\n",
 					name, provider.Type, status, len(provider.Models))
 			}
 		},

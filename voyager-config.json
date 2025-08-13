@@ -1,17 +1,27 @@
 {
   "providers": {
+    "openai": {
+      "type": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}",
+      "models": [
+        "gpt-oss-120b",
+        "gpt-3.5-turbo"
+      ]
+    },
     "ollama": {
       "type": "ollama",
       "base_url": "http://localhost:11434",
       "models": [
+        "moondream",
         "llama3.2",
         "codellama",
         "mistral",
-        "phi3",
+        "phi3:latest",
         "qwen2.5-coder"
       ]
     }
   },
-  "default_model": "llama3.2",
+  "default_model": "moondream",
   "default_provider": "ollama"
 }
