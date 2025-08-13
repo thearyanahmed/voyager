@@ -114,12 +114,17 @@ type ChatModel struct {
 	width           int
 	height          int
 	err             error
+	spinnerIndex    int
 }
 
 type responseMsg struct {
 	content string
 	err     error
 }
+
+type tickMsg time.Time
+
+var spinnerFrames = []string{"[+]", "[/]", "[-]", "[\\]"}
 
 func initialModel(config *Config) ChatModel {
 	ta := textarea.New()
@@ -162,6 +167,12 @@ func initialModel(config *Config) ChatModel {
 	}
 }
 
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Millisecond*200, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
 func (m ChatModel) Init() tea.Cmd {
 	return textarea.Blink
 }
@@ -177,6 +188,13 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.viewport, vpCmd = m.viewport.Update(msg)
 
 	switch msg := msg.(type) {
+	case tickMsg:
+		if m.loading {
+			m.spinnerIndex = (m.spinnerIndex + 1) % len(spinnerFrames)
+			m.updateViewport()
+			return m, tickCmd()
+		}
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -231,9 +249,10 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.conversation = append(m.conversation, userMsg)
 			m.textarea.Reset()
 			m.loading = true
+			m.spinnerIndex = 0
 			m.updateViewport()
 
-			return m, m.sendMessage()
+			return m, tea.Batch(m.sendMessage(), tickCmd())
 		}
 
 	case responseMsg:
@@ -806,7 +825,8 @@ func (m *ChatModel) updateViewport() {
 	}
 
 	if m.loading {
-		content.WriteString(msgContentStyle.Render("thinking..."))
+		spinner := spinnerFrames[m.spinnerIndex]
+		content.WriteString(msgContentStyle.Render(fmt.Sprintf("%s thinking...", spinner)))
 		content.WriteString("\n")
 	}
 
