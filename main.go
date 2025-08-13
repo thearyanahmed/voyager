@@ -125,10 +125,10 @@ func initialModel(config *Config) ChatModel {
 	ta := textarea.New()
 	ta.Placeholder = "Type your message here..."
 	ta.Focus()
-	ta.Prompt = "┃ "
+	ta.Prompt = ""
 	ta.CharLimit = 4000
 	ta.SetWidth(80)
-	ta.SetHeight(3)
+	ta.SetHeight(1)
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.ShowLineNumbers = false
 
