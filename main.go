@@ -53,8 +53,8 @@ type Message struct {
 // Styles for the TUI
 var (
 	titleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFDF5")).
-			Background(lipgloss.Color("#FF6B35")).
+			Foreground(lipgloss.Color("#8B4513")).
+			Background(lipgloss.Color("#F5F5DC")).
 			Padding(0, 1).
 			Bold(true)
 
@@ -62,13 +62,13 @@ var (
 			Foreground(lipgloss.Color("#626262")).
 			Italic(true)
 	userMsgStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#00D9FF")).
+			Foreground(lipgloss.Color("#8B4513")).
 			Bold(true).
 			MarginLeft(0).
 			MarginRight(2)
 
 	assistantMsgStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#FF6B35")).
+				Foreground(lipgloss.Color("#D2691E")).
 				Bold(true).
 				MarginLeft(0).
 				MarginRight(2)
@@ -80,13 +80,13 @@ var (
 			MarginRight(2)
 
 	msgContentStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFDF5")).
+			Foreground(lipgloss.Color("#8B4513")).
 			MarginLeft(2).
 			MarginBottom(1)
 
 	inputStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#FF6B35")).
+			BorderForeground(lipgloss.Color("#F5F5DC")).
 			Padding(1).
 			Margin(0, 1)
 
