@@ -210,7 +210,7 @@ var (
 	inputStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("#FAFAF7")).
-			Padding(0).
+			Padding(0, 1).
 			Margin(0)
 
 	helpStyle = lipgloss.NewStyle().
