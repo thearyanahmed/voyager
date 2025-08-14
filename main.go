@@ -2433,11 +2433,25 @@ func (m *ChatModel) buildToolsContext() string {
 		return ""
 	}
 	
+	// Add native tools information
+	context.WriteString("**Native Tools (always available):**\n")
+	for name, tool := range m.nativeTools {
+		context.WriteString(fmt.Sprintf("- `%s`: %s\n", name, tool.Description))
+	}
+	context.WriteString("\n")
+	
 	context.WriteString("USAGE INSTRUCTIONS:\n")
 	context.WriteString("- When users ask questions that could be answered using these tools, suggest using the tool\n")
 	context.WriteString("- Use format: \"I can help with that! Let me use the `tool-name` tool: [TOOL_CALL:tool-name:arguments]\"\n")
 	context.WriteString("- For questions about DigitalOcean apps/droplets/resources, use the appropriate digitalocean tools\n")
 	context.WriteString("- Always explain what the tool does before calling it\n\n")
+	
+	context.WriteString("TOOL CHAINING FOR DIRECTORY OPERATIONS:\n")
+	context.WriteString("- When users ask about 'current directory', 'this directory', 'here', etc:\n")
+	context.WriteString("  1. First use: [TOOL_CALL:bash:{\"command\":\"pwd\"}] to get current directory\n")
+	context.WriteString("  2. Then use filesystem tools with the result: [TOOL_CALL:list_directory:{\"path\":\"/the/current/path\"}]\n")
+	context.WriteString("- Always use absolute paths for filesystem MCP tools\n")
+	context.WriteString("- Chain tools together to build context and complete complex tasks\n\n")
 	
 	return context.String()
 }
@@ -3562,6 +3576,14 @@ The user has activated deployment mode. You now have deployment knowledge loaded
 
 func (m *ChatModel) loadDeployContext() (string, error) {
 	var contextBuilder strings.Builder
+	
+	// Load tools.md (general tool usage)
+	toolsContent, err := embeddedContexts.ReadFile("contexts/tools.md")
+	if err != nil {
+		return "", fmt.Errorf("failed to load tools.md: %v", err)
+	}
+	contextBuilder.WriteString(string(toolsContent))
+	contextBuilder.WriteString("\n\n")
 	
 	// Load deploy.md
 	deployContent, err := embeddedContexts.ReadFile("contexts/deploy.md")
