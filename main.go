@@ -197,27 +197,28 @@ var (
 			MarginLeft(2)
 
 	userMsgStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#A0A0A0")).
+			Foreground(lipgloss.Color("#666666")).
 			Bold(true).
 			MarginLeft(0).
 			MarginRight(0)
 
 	assistantMsgStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#A0A0A0")).
+				Foreground(lipgloss.Color("#666666")).
 				Bold(true).
 				MarginLeft(0).
 				MarginRight(0)
 
 	systemMsgStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#A0A0A0")).
+			Foreground(lipgloss.Color("#666666")).
 			Bold(true).
 			MarginLeft(0).
 			MarginRight(0)
 
 	msgContentStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#A0A0A0")).
+			Foreground(lipgloss.Color("#666666")).
 			MarginLeft(0).
-			MarginBottom(0)
+			MarginBottom(0).
+			Width(0) // No width limit - allow full wrapping
 
 	inputStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
@@ -261,6 +262,7 @@ type ChatModel struct {
 	toolCallData       interface{}
 	toolCallStepIndex  int
 	processingToolResult bool // Flag to prevent tool call detection loops
+	pendingToolCalls   []ToolCall // Queue of tool calls to execute in sequence
 	
 	// Orchestrator state
 	orchestratorState  *OrchestratorState
@@ -521,6 +523,11 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.debugLog("LLM_RESPONSE", "LLM responded to tool result (length: %d chars): %s", len(msg.content), msg.content[:min(200, len(msg.content))])
 			}
 			
+			// Check if this is a pipeline response (contains JSON pipeline)
+			if m.isPipelineResponse(msg.content) {
+				return m.processPipelineResponse(msg.content)
+			}
+			
 			// Check for tool calls in the response (but not when processing tool results)
 			if !m.processingToolResult && m.containsToolCalls(msg.content) {
 				return m.processToolCallResponse(msg.content)
@@ -673,6 +680,7 @@ func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 /mcp call <tool> [args] - Call MCP tool (formatted output)
 /mcp raw <tool> [args] - Call MCP tool (raw JSON output)
 /deploy - Deploy current project to DigitalOcean App Platform
+/plan <task> - Create and execute dynamic pipeline for complex tasks
 /orchestrate <pipeline-json> - Execute orchestrator pipeline
 /help - Show this help
 /quit - Exit voyager
@@ -773,6 +781,28 @@ Esc - Quit`
 		m.conversation = append(m.conversation, userMsg)
 		
 		return m.handleDeployCommand()
+
+	case "plan":
+		if len(parts) < 2 {
+			systemMsg := Message{
+				Role:      "system",
+				Content:   "Usage: /plan <task description>",
+				Timestamp: time.Now(),
+			}
+			m.conversation = append(m.conversation, systemMsg)
+			m.updateViewport()
+		} else {
+			taskDescription := strings.Join(parts[1:], " ")
+			// Add user message showing the plan command
+			userMsg := Message{
+				Role:      "user",
+				Content:   fmt.Sprintf("/plan %s", taskDescription),
+				Timestamp: time.Now(),
+			}
+			m.conversation = append(m.conversation, userMsg)
+			
+			return m.handlePlanCommand(taskDescription)
+		}
 
 	case "quit", "exit":
 		return *m, tea.Quit
@@ -1420,6 +1450,8 @@ func (m ChatModel) executeStep(step *OrchestratorStep) (tea.Model, tea.Cmd) {
 	switch step.Type {
 	case "mcp":
 		return m.executeMCPStep(step, startTime)
+	case "tool":
+		return m.executeToolStep(step, startTime)
 	case "llm":
 		return m.executeLLMStep(step, startTime)
 	case "condition":
@@ -1475,6 +1507,71 @@ func (m ChatModel) executeMCPStep(step *OrchestratorStep, startTime time.Time) (
 			Output:    output,
 			Error:     err,
 			Duration:  time.Since(startTime),
+			Timestamp: time.Now(),
+		}
+		return orchestratorStepMsg{stepID: step.ID, result: result}
+	}
+}
+
+func (m ChatModel) executeToolStep(step *OrchestratorStep, startTime time.Time) (tea.Model, tea.Cmd) {
+	// Parse arguments from step input or context
+	var arguments map[string]interface{}
+	if step.Input != nil {
+		// Apply context substitution to input
+		arguments = m.applyContextSubstitution(step.Input.(map[string]interface{}))
+	}
+	
+	toolName := step.Action
+	
+	// Check if it's a native tool first
+	if tool, exists := m.nativeTools[toolName]; exists {
+		m.debugLog("ORCHESTRATOR", "Executing native tool: %s", toolName)
+		return m, func() tea.Msg {
+			result, err := tool.Handler(arguments)
+			duration := time.Since(startTime)
+			stepResult := &StepResult{
+				StepID:    step.ID,
+				Type:      step.Type,
+				Success:   err == nil,
+				Output:    result,
+				Error:     err,
+				Duration:  duration,
+				Timestamp: time.Now(),
+			}
+			return orchestratorStepMsg{stepID: step.ID, result: stepResult}
+		}
+	}
+	
+	// Otherwise try MCP tools
+	client := m.getMCPClientForTool(toolName)
+	if client == nil {
+		duration := time.Since(startTime)
+		result := &StepResult{
+			StepID:    step.ID,
+			Type:      step.Type,
+			Success:   false,
+			Output:    nil,
+			Error:     fmt.Errorf("tool '%s' not found in native tools or MCP servers", toolName),
+			Duration:  duration,
+			Timestamp: time.Now(),
+		}
+		return m, func() tea.Msg {
+			return orchestratorStepMsg{stepID: step.ID, result: result}
+		}
+	}
+	
+	// Execute MCP tool asynchronously
+	m.debugLog("ORCHESTRATOR", "Executing MCP tool: %s", toolName)
+	return m, func() tea.Msg {
+		output, err := client.callTool(toolName, arguments)
+		duration := time.Since(startTime)
+		result := &StepResult{
+			StepID:    step.ID,
+			Type:      step.Type,
+			Success:   err == nil,
+			Output:    output,
+			Error:     err,
+			Duration:  duration,
 			Timestamp: time.Now(),
 		}
 		return orchestratorStepMsg{stepID: step.ID, result: result}
@@ -1688,24 +1785,52 @@ func (m ChatModel) formatOrchestratorResults(status, message string) string {
 		return fmt.Sprintf("Orchestrator finished: %s - %s", status, message)
 	}
 	
-	var result strings.Builder
-	result.WriteString(fmt.Sprintf("🔄 Orchestrator Pipeline: %s\n", m.orchestratorState.Pipeline.Name))
-	result.WriteString(fmt.Sprintf("Status: %s\n", status))
-	result.WriteString(fmt.Sprintf("Duration: %v\n", time.Since(m.orchestratorState.Context.StartTime)))
-	result.WriteString(fmt.Sprintf("Steps executed: %d\n\n", m.orchestratorState.Context.StepCount))
+	// Log detailed debug info
+	m.debugLog("PIPELINE_COMPLETE", "Pipeline '%s' %s in %v (%d steps)", 
+		m.orchestratorState.Pipeline.Name, 
+		status,
+		time.Since(m.orchestratorState.Context.StartTime),
+		m.orchestratorState.Context.StepCount)
 	
-	if len(m.orchestratorState.Results) > 0 {
-		result.WriteString("Step Results:\n")
-		for _, res := range m.orchestratorState.Results {
-			status := "✅"
-			if !res.Success {
-				status = "❌"
+	// Extract and return only the clean user output
+	var outputs []string
+	var errors []string
+	
+	for _, res := range m.orchestratorState.Results {
+		// Log step details to debug
+		stepStatus := "SUCCESS"
+		if !res.Success {
+			stepStatus = "FAILED"
+		}
+		m.debugLog("PIPELINE_STEP", "Step %s (%s) %s in %v", res.StepID, res.Type, stepStatus, res.Duration)
+		
+		if res.Success && res.Output != nil {
+			if outputStr, ok := res.Output.(string); ok && strings.TrimSpace(outputStr) != "" {
+				// For bash date command, add context
+				if res.Type == "tool" && strings.Contains(outputStr, "2025") {
+					outputs = append(outputs, fmt.Sprintf("Current time: %s", strings.TrimSpace(outputStr)))
+				} else {
+					outputs = append(outputs, strings.TrimSpace(outputStr))
+				}
 			}
-			result.WriteString(fmt.Sprintf("%s %s (%s) - %v\n", status, res.StepID, res.Type, res.Duration))
+		}
+		
+		if res.Error != nil {
+			errors = append(errors, fmt.Sprintf("Error: %v", res.Error))
+			m.debugLog("PIPELINE_ERROR", "Step %s failed: %v", res.StepID, res.Error)
 		}
 	}
 	
-	return result.String()
+	// Return clean output for user
+	var result strings.Builder
+	for _, output := range outputs {
+		result.WriteString(output + "\n")
+	}
+	for _, err := range errors {
+		result.WriteString(err + "\n")
+	}
+	
+	return strings.TrimSpace(result.String())
 }
 
 // LLM-assisted formatting for MCP tool results
@@ -2347,16 +2472,22 @@ func (m *ChatModel) extractFieldsManually(response string) []string {
 
 // Initialize Glamour markdown renderer
 func (m *ChatModel) initializeMarkdownRenderer() {
-	// Create renderer with auto-detected style (dark/light based on terminal)
+	// Use available width for markdown rendering
+	width := m.width - 8 // Account for padding and borders
+	if width < 40 {
+		width = 80 // Fallback for initial setup
+	}
+	
+	// Create renderer with no color styling to let lipgloss handle colors
 	renderer, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(80), // Default width, will be updated
+		glamour.WithStandardStyle("notty"), // No colors, plain text formatting only
+		glamour.WithWordWrap(width),
 	)
 	if err != nil {
-		// Fallback to basic renderer if auto-style fails
+		// Fallback to basic renderer if notty fails
 		renderer, _ = glamour.NewTermRenderer(
-			glamour.WithStandardStyle("dark"),
-			glamour.WithWordWrap(80),
+			glamour.WithStandardStyle("ascii"), // Another no-color option
+			glamour.WithWordWrap(width),
 		)
 	}
 	m.markdownRenderer = renderer
@@ -2380,13 +2511,13 @@ func (m *ChatModel) updateMarkdownWidth() {
 
 func (m *ChatModel) initializeMarkdownRendererWithWidth(width int) {
 	renderer, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
+		glamour.WithStandardStyle("notty"), // No colors, plain text formatting only
 		glamour.WithWordWrap(width),
 	)
 	if err != nil {
 		// Fallback
 		renderer, _ = glamour.NewTermRenderer(
-			glamour.WithStandardStyle("dark"),
+			glamour.WithStandardStyle("ascii"), // Another no-color option
 			glamour.WithWordWrap(width),
 		)
 	}
@@ -2446,12 +2577,21 @@ func (m *ChatModel) buildToolsContext() string {
 	context.WriteString("- For questions about DigitalOcean apps/droplets/resources, use the appropriate digitalocean tools\n")
 	context.WriteString("- Always explain what the tool does before calling it\n\n")
 	
-	context.WriteString("TOOL CHAINING FOR DIRECTORY OPERATIONS:\n")
-	context.WriteString("- When users ask about 'current directory', 'this directory', 'here', etc:\n")
-	context.WriteString("  1. First use: [TOOL_CALL:bash:{\"command\":\"pwd\"}] to get current directory\n")
-	context.WriteString("  2. Then use filesystem tools with the result: [TOOL_CALL:list_directory:{\"path\":\"/the/current/path\"}]\n")
-	context.WriteString("- Always use absolute paths for filesystem MCP tools\n")
-	context.WriteString("- Chain tools together to build context and complete complex tasks\n\n")
+	context.WriteString("IMPORTANT - ONE TOOL CALL ONLY:\n")
+	context.WriteString("- For simple questions, use EXACTLY ONE tool call\n")
+	context.WriteString("- Time/date: [TOOL_CALL:bash:{\"command\":\"date\"}] - NEVER make multiple date calls\n")
+	context.WriteString("- Current directory: [TOOL_CALL:bash:{\"command\":\"pwd\"}]\n") 
+	context.WriteString("- System info: [TOOL_CALL:bash:{\"command\":\"uname -a\"}]\n")
+	context.WriteString("- CRITICAL: Do NOT make 2+ tool calls for simple questions\n")
+	context.WriteString("- ONE command = ONE tool call\n\n")
+	
+	context.WriteString("TOOL CHAINING (only for complex multi-step operations):\n")
+	context.WriteString("- ONLY use multiple tool calls when user asks for complex operations requiring multiple steps\n")
+	context.WriteString("- For 'list files in current directory' or similar:\n")
+	context.WriteString("  1. First: [TOOL_CALL:bash:{\"command\":\"pwd\"}]\n")
+	context.WriteString("  2. Then: [TOOL_CALL:list_directory:{\"path\":\"/the/result/path\"}]\n")
+	context.WriteString("- Do NOT chain tools for simple single-step questions\n")
+	context.WriteString("- Always use absolute paths for filesystem MCP tools\n\n")
 	
 	return context.String()
 }
@@ -2513,12 +2653,24 @@ func (m ChatModel) processToolCallResponse(content string) (tea.Model, tea.Cmd) 
 		return m, nil
 	}
 	
-	// Execute the first tool call (we can extend this to handle multiple later)
-	toolCall := toolCalls[0]
-	m.debugLog("SUCCESS", "LLM suggested tool call: %s", toolCall.Name)
+	// For any tool calls (single or multiple), ask LLM to plan proper steps
+	m.debugLog("PIPELINE_PLAN", "Detected %d tool calls - asking LLM to plan execution steps", len(toolCalls))
 	
-	// Execute the tool call
-	return m.executeAutoToolCall(toolCall)
+	// Extract the user's original request from conversation
+	var userRequest string
+	if len(m.conversation) > 0 {
+		lastMsg := m.conversation[len(m.conversation)-2] // Get user message before assistant response
+		if lastMsg.Role == "user" {
+			userRequest = lastMsg.Content
+		}
+	}
+	
+	if userRequest == "" {
+		userRequest = "Execute the suggested tools"
+	}
+	
+	// Ask LLM to plan the execution steps
+	return m.handlePlanCommand(userRequest)
 }
 
 // Remove tool call tags from content for display
@@ -2726,6 +2878,19 @@ func (m ChatModel) handleAutoToolCallResult(result autoToolCallResult) (tea.Mode
 	m.conversation = append(m.conversation, resultMsg)
 	
 	m.updateViewport()
+	
+	// Check if there are pending tool calls to execute
+	if len(m.pendingToolCalls) > 0 {
+		nextToolCall := m.pendingToolCalls[0]
+		m.pendingToolCalls = m.pendingToolCalls[1:]
+		
+		// Apply intelligent argument substitution for common patterns
+		nextToolCall = m.applyToolChainSubstitution(result.toolName, result.result, nextToolCall)
+		
+		m.debugLog("TOOL_CHAIN", "Executing next tool in chain: %s", nextToolCall.Name)
+		return m.executeAutoToolCall(nextToolCall)
+	}
+	
 	return m, nil
 }
 
@@ -3222,10 +3387,10 @@ func (m *ChatModel) debugLog(level string, message string, args ...interface{}) 
 			formattedMsg)
 	}
 
-	// Add to debug logs (keep only last 100 lines for more history)
+	// Add to debug logs (keep only last 1000 lines for scrollback history)
 	m.debugLogs = append(m.debugLogs, logLine)
-	if len(m.debugLogs) > 100 {
-		m.debugLogs = m.debugLogs[len(m.debugLogs)-100:]
+	if len(m.debugLogs) > 1000 {
+		m.debugLogs = m.debugLogs[len(m.debugLogs)-1000:]
 	}
 
 	// Update debug window content
@@ -3271,7 +3436,9 @@ func (m *ChatModel) updateViewport() {
 			// Don't show user messages
 
 		case "assistant":
-			content.WriteString(msgContentStyle.Render(strings.TrimLeft(msg.Content, "\n")))
+			// Process content through markdown renderer for proper wrapping
+			processedContent := m.renderMarkdown(strings.TrimLeft(msg.Content, "\n"))
+			content.WriteString(msgContentStyle.Render(processedContent))
 			content.WriteString("\n\n")
 
 		case "system":
@@ -3341,7 +3508,7 @@ func (m ChatModel) View() string {
 
 	// Chat area without border - this now contains the ASCII art when appropriate
 	chatArea := lipgloss.NewStyle().
-		Padding(0, 2).
+		Padding(0, 1). // Reduced padding to allow more content width
 		Height(m.viewport.Height).
 		Render(m.viewport.View())
 
@@ -3351,8 +3518,9 @@ func (m ChatModel) View() string {
 		debugStyle := lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("240")).
+			Foreground(lipgloss.Color("#666666")). // 40% opacity of normal text
 			Padding(0, 1).
-			Height(3)
+			Height(6) // Increased height for better scrolling
 		debugArea = debugStyle.Render(m.debugWindow.View())
 	}
 
@@ -3364,9 +3532,7 @@ func (m ChatModel) View() string {
 		return lipgloss.JoinVertical(
 			lipgloss.Left,
 			info,
-			"",
 			chatArea,
-			"",
 			debugArea,
 			inputArea,
 			help,
@@ -3375,9 +3541,7 @@ func (m ChatModel) View() string {
 		return lipgloss.JoinVertical(
 			lipgloss.Left,
 			info,
-			"",
 			chatArea,
-			"",
 			inputArea,
 			help,
 		)
@@ -3794,6 +3958,18 @@ func (m ChatModel) handleNativeToolResult(result nativeToolResult) (tea.Model, t
 	m.conversation = append(m.conversation, resultMsg)
 	m.updateViewport()
 	
+	// Check if there are pending tool calls to execute
+	if len(m.pendingToolCalls) > 0 {
+		nextToolCall := m.pendingToolCalls[0]
+		m.pendingToolCalls = m.pendingToolCalls[1:]
+		
+		// Apply intelligent argument substitution for common patterns
+		nextToolCall = m.applyToolChainSubstitution(result.toolName, result.result, nextToolCall)
+		
+		m.debugLog("TOOL_CHAIN", "Executing next tool in chain: %s", nextToolCall.Name)
+		return m.executeAutoToolCall(nextToolCall)
+	}
+	
 	return m, nil
 }
 
@@ -3897,6 +4073,359 @@ func (m *ChatModel) handleGrepTool(args map[string]interface{}) (interface{}, er
 	}
 	
 	return string(output), nil
+}
+
+// Create dynamic pipeline from multiple tool calls with automatic context passing
+func (m *ChatModel) createDynamicPipelineFromToolCalls(toolCalls []ToolCall) (tea.Model, tea.Cmd) {
+	// Create pipeline structure
+	pipeline := OrchestratorPipeline{
+		Name:          fmt.Sprintf("auto-pipeline-%d-tools", len(toolCalls)),
+		StartStep:     "step1",
+		Steps:         make(map[string]OrchestratorStep),
+		Context:       make(map[string]interface{}),
+		MaxSteps:      len(toolCalls),
+		GlobalTimeout: 300 * time.Second, // 5 minutes
+	}
+	
+	// Convert each tool call to a pipeline step
+	for i, toolCall := range toolCalls {
+		stepID := fmt.Sprintf("step%d", i+1)
+		nextStepID := ""
+		if i < len(toolCalls)-1 {
+			nextStepID = fmt.Sprintf("step%d", i+2)
+		}
+		
+		step := OrchestratorStep{
+			ID:     stepID,
+			Type:   "tool",
+			Action: toolCall.Name,
+			Input:  toolCall.Arguments,
+		}
+		
+		// Set next step
+		if nextStepID != "" {
+			step.NextStep = map[string]string{"success": nextStepID}
+		} else {
+			step.NextStep = map[string]string{} // Final step
+		}
+		
+		pipeline.Steps[stepID] = step
+	}
+	
+	m.debugLog("PIPELINE_AUTO", "Created pipeline with %d steps: %v", len(pipeline.Steps), pipeline.Name)
+	
+	// Execute the pipeline
+	return m.startOrchestrator(&pipeline)
+}
+
+// Apply context substitution for tool chaining - used by pipeline orchestrator
+func (m *ChatModel) applyToolChainSubstitution(prevToolName string, prevResult interface{}, nextToolCall ToolCall) ToolCall {
+	// For simple tool chaining (non-pipeline), just store result for potential LLM-generated pipeline
+	if nextToolCall.Arguments == nil {
+		nextToolCall.Arguments = make(map[string]interface{})
+	}
+	
+	// Store previous result in context for potential pipeline creation
+	if m.orchestratorState == nil {
+		// Not in pipeline mode - trigger pipeline planning with context
+		m.debugLog("TOOL_CHAIN", "Tool chain detected - initiating pipeline planning")
+		return nextToolCall
+	}
+	
+	// Apply pipeline context substitution using orchestrator
+	return ToolCall{
+		Name: nextToolCall.Name,
+		Arguments: m.applyContextSubstitution(nextToolCall.Arguments),
+	}
+}
+
+// Dynamic pipeline planning
+func (m ChatModel) handlePlanCommand(taskDescription string) (tea.Model, tea.Cmd) {
+	m.debugLog("PLANNER", "Creating dynamic pipeline for task: %s", taskDescription)
+	
+	// Create a system message with available tools context for planning
+	availableTools := m.buildAvailableToolsContext()
+	
+	planningPrompt := fmt.Sprintf(`You are a pipeline planner. Create a JSON pipeline to accomplish this task: "%s"
+
+AVAILABLE TOOLS:
+%s
+
+Create a pipeline with these step types:
+- "llm": For generating content, explanations, or analysis
+- "tool": For executing native tools (bash, read, write, glob, grep) or MCP tools
+- "condition": For conditional logic based on previous results
+
+Pipeline JSON format:
+{
+  "name": "descriptive-name",
+  "start_step": "step1",
+  "steps": {
+    "step1": {
+      "id": "step1", 
+      "type": "tool",
+      "action": "bash",
+      "input": {"command": "pwd"},
+      "next_step": {"success": "step2"}
+    },
+    "step2": {
+      "id": "step2",
+      "type": "tool", 
+      "action": "list_directory",
+      "input": {"path": "{{.prev_result}}"},
+      "next_step": {}
+    }
+  }
+}
+
+IMPORTANT:
+- For "tool" type: "action" = tool name, "input" = JSON object with tool arguments
+- For "llm" type: "action" = prompt text, "input" = context variables
+- For bash tool: use {"command": "shell_command_here"}
+- For file tools: use {"path": "/file/path"} or {"path": "{{.prev_result}}"}
+- Use {{.prev_result}} to pass output from previous step
+- Use {{.step_name}} to reference output from specific named steps
+- For "next_step": use {"success": "next_step_id"} or {} for final step
+- NEVER use arrays [] for next_step, always use objects {}
+
+Respond with ONLY the JSON pipeline, no explanation.`, taskDescription, availableTools)
+	
+	// Create planning request
+	planningMsg := Message{
+		Role:    "user",
+		Content: planningPrompt,
+	}
+	
+	// Make API request for planning
+	m.loading = true
+	m.updateViewport()
+	
+	return m, func() tea.Msg {
+		response, err := m.makeAPIRequestWithCustomMessages([]Message{planningMsg})
+		if err != nil {
+			return responseMsg{content: "", err: fmt.Errorf("planning failed: %v", err)}
+		}
+		return responseMsg{content: response, err: nil}
+	}
+}
+
+func (m ChatModel) makeAPIRequestWithCustomMessages(messages []Message) (string, error) {
+	provider := m.config.Providers[m.currentProvider]
+	
+	// Convert messages to API format
+	var apiMessages []Message
+	for _, msg := range messages {
+		apiMessages = append(apiMessages, Message{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
+	}
+	
+	// Use DigitalOcean provider (extend for other providers as needed)
+	type DigitalOceanRequest struct {
+		Model       string    `json:"model"`
+		Messages    []Message `json:"messages"`
+		Temperature float64   `json:"temperature,omitempty"`
+		MaxTokens   int       `json:"max_tokens,omitempty"`
+	}
+	
+	request := DigitalOceanRequest{
+		Model:       m.currentModel,
+		Messages:    apiMessages,
+		Temperature: 0.7,
+		MaxTokens:   4000,
+	}
+	
+	jsonData, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %v", err)
+	}
+	
+	req, err := http.NewRequest("POST", provider.BaseURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+	
+	// Set headers based on provider type  
+	req.Header.Set("Content-Type", "application/json")
+	if provider.Type == "digitalocean" {
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", provider.APIKey))
+	}
+	
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %v", err)
+	}
+	
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API error: %s", string(body))
+	}
+	
+	type DigitalOceanResponse struct {
+		Choices []struct {
+			Message Message `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	
+	var response DigitalOceanResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", fmt.Errorf("failed to unmarshal response: %v", err)
+	}
+	
+	if response.Error != nil {
+		return "", fmt.Errorf("API error: %s", response.Error.Message)
+	}
+	
+	if len(response.Choices) == 0 {
+		return "", fmt.Errorf("no response received")
+	}
+	
+	return response.Choices[0].Message.Content, nil
+}
+
+func (m *ChatModel) buildAvailableToolsContext() string {
+	var tools []string
+	
+	// Add native tools
+	for name, tool := range m.nativeTools {
+		tools = append(tools, fmt.Sprintf("- %s (native): %s", name, tool.Description))
+	}
+	
+	// Add MCP tools
+	for _, client := range m.mcpClients {
+		for _, tool := range client.Tools {
+			desc := tool.Description
+			if desc == "" {
+				desc = "No description available"
+			}
+			tools = append(tools, fmt.Sprintf("- %s (mcp): %s", tool.Name, desc))
+		}
+	}
+	
+	return strings.Join(tools, "\n")
+}
+
+// Pipeline response processing
+func (m *ChatModel) isPipelineResponse(content string) bool {
+	// Check if the response contains a JSON pipeline structure
+	content = strings.TrimSpace(content)
+	
+	m.debugLog("PIPELINE_DETECT", "Checking if response is pipeline - length: %d, starts with {: %v", len(content), strings.HasPrefix(content, "{"))
+	
+	// Handle markdown code blocks
+	if strings.Contains(content, "```json") {
+		startIdx := strings.Index(content, "```json") + 7
+		endIdx := strings.LastIndex(content, "```")
+		if endIdx > startIdx {
+			content = content[startIdx:endIdx]
+			content = strings.TrimSpace(content)
+			m.debugLog("PIPELINE_DETECT", "Extracted JSON from markdown: %s", content[:min(100, len(content))])
+		}
+	} else if strings.Contains(content, "```") {
+		// Handle plain code blocks
+		parts := strings.Split(content, "```")
+		if len(parts) >= 3 {
+			content = strings.TrimSpace(parts[1])
+			m.debugLog("PIPELINE_DETECT", "Extracted from code block: %s", content[:min(100, len(content))])
+		}
+	}
+	
+	m.debugLog("PIPELINE_DETECT", "After extraction - starts with {: %v, has steps: %v, has start_step: %v", 
+		strings.HasPrefix(content, "{"), 
+		strings.Contains(content, "\"steps\""), 
+		strings.Contains(content, "\"start_step\""))
+	
+	if strings.HasPrefix(content, "{") && strings.Contains(content, "\"steps\"") && strings.Contains(content, "\"start_step\"") {
+		// Try to parse as pipeline JSON
+		var pipeline OrchestratorPipeline
+		err := json.Unmarshal([]byte(content), &pipeline)
+		parseSuccess := err == nil
+		if !parseSuccess {
+			m.debugLog("PIPELINE_DETECT", "JSON parse error: %v", err)
+		}
+		m.debugLog("PIPELINE_DETECT", "Pipeline JSON parse success: %v", parseSuccess)
+		return parseSuccess
+	}
+	m.debugLog("PIPELINE_DETECT", "Pipeline detection failed - not a valid pipeline format")
+	return false
+}
+
+func (m ChatModel) processPipelineResponse(content string) (tea.Model, tea.Cmd) {
+	// Extract JSON from the response (handle cases where LLM adds extra text)
+	content = strings.TrimSpace(content)
+	
+	// Handle markdown code blocks first
+	if strings.Contains(content, "```json") {
+		startIdx := strings.Index(content, "```json") + 7
+		endIdx := strings.LastIndex(content, "```")
+		if endIdx > startIdx {
+			content = content[startIdx:endIdx]
+			content = strings.TrimSpace(content)
+		}
+	} else if strings.Contains(content, "```") {
+		// Handle plain code blocks
+		parts := strings.Split(content, "```")
+		if len(parts) >= 3 {
+			content = strings.TrimSpace(parts[1])
+		}
+	}
+	
+	// Find JSON boundaries
+	startIdx := strings.Index(content, "{")
+	if startIdx == -1 {
+		return m, nil
+	}
+	
+	// Find the matching closing brace
+	braceCount := 0
+	endIdx := -1
+	for i := startIdx; i < len(content); i++ {
+		if content[i] == '{' {
+			braceCount++
+		} else if content[i] == '}' {
+			braceCount--
+			if braceCount == 0 {
+				endIdx = i
+				break
+			}
+		}
+	}
+	
+	if endIdx == -1 {
+		return m, nil
+	}
+	
+	pipelineJSON := content[startIdx : endIdx+1]
+	
+	// Parse the pipeline
+	var pipeline OrchestratorPipeline
+	if err := json.Unmarshal([]byte(pipelineJSON), &pipeline); err != nil {
+		m.debugLog("PIPELINE_ERROR", "Failed to parse pipeline JSON: %v", err)
+		errorMsg := Message{
+			Role:      "system",
+			Content:   fmt.Sprintf("❌ Failed to parse pipeline: %v", err),
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, errorMsg)
+		m.updateViewport()
+		return m, nil
+	}
+	
+	// Log pipeline creation to debug instead of showing to user
+	m.debugLog("PIPELINE_CREATE", "Created dynamic pipeline '%s' with %d steps", pipeline.Name, len(pipeline.Steps))
+	
+	// Execute the pipeline
+	m.debugLog("PIPELINE", "Executing dynamic pipeline: %s with %d steps", pipeline.Name, len(pipeline.Steps))
+	return m.startOrchestrator(&pipeline)
 }
 
 func main() {
