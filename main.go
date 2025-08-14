@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,6 +23,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 )
+
+//go:embed contexts/*.md
+var embeddedContexts embed.FS
 
 // Helper functions
 func min(a, b int) int {
@@ -657,6 +661,7 @@ func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 /mcp tools - List available MCP tools
 /mcp call <tool> [args] - Call MCP tool (formatted output)
 /mcp raw <tool> [args] - Call MCP tool (raw JSON output)
+/deploy - Deploy current project to DigitalOcean App Platform
 /orchestrate <pipeline-json> - Execute orchestrator pipeline
 /help - Show this help
 /quit - Exit voyager
@@ -719,6 +724,17 @@ Esc - Quit`
 				return m.startOrchestrator(&pipeline)
 			}
 		}
+
+	case "deploy":
+		// Add user message showing the deploy command
+		userMsg := Message{
+			Role:      "user",
+			Content:   "/deploy",
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, userMsg)
+		
+		return m.handleDeployCommand()
 
 	case "quit", "exit":
 		return *m, tea.Quit
@@ -3414,6 +3430,212 @@ func saveConfig(config *Config) error {
 		return err
 	}
 	return os.WriteFile("voyager-config.json", data, 0644)
+}
+
+// Deploy command handlers
+func (m ChatModel) handleDeployCommand() (tea.Model, tea.Cmd) {
+	m.debugLog("DEPLOY", "Starting deployment process")
+	
+	// Load embedded deployment contexts
+	deployContext, err := m.loadDeployContext()
+	if err != nil {
+		systemMsg := Message{
+			Role:      "system",
+			Content:   fmt.Sprintf("Failed to load deployment context: %v", err),
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, systemMsg)
+		m.updateViewport()
+		return m, nil
+	}
+	
+	// Analyze current directory
+	projectAnalysis, err := m.analyzeCurrentProject()
+	if err != nil {
+		systemMsg := Message{
+			Role:      "system",
+			Content:   fmt.Sprintf("Failed to analyze project: %v", err),
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, systemMsg)
+		m.updateViewport()
+		return m, nil
+	}
+	
+	// Create system message with deployment context and project analysis
+	systemMsg := Message{
+		Role: "system",
+		Content: fmt.Sprintf(`%s
+
+## Current Project Analysis
+%s
+
+The user has activated deployment mode. You now have deployment knowledge loaded and can help with DigitalOcean App Platform questions and tasks.`, deployContext, projectAnalysis),
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, systemMsg)
+	
+	// Add a friendly assistant message
+	assistantMsg := Message{
+		Role:      "assistant", 
+		Content:   "✅ Deployment mode activated! I've analyzed your project and loaded DigitalOcean App Platform knowledge. I can now help you create app specs, answer deployment questions, or deploy your application. What would you like to do?",
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, assistantMsg)
+	
+	m.updateViewport()
+	return m, nil
+}
+
+func (m *ChatModel) loadDeployContext() (string, error) {
+	var contextBuilder strings.Builder
+	
+	// Load deploy.md
+	deployContent, err := embeddedContexts.ReadFile("contexts/deploy.md")
+	if err != nil {
+		return "", fmt.Errorf("failed to load deploy.md: %v", err)
+	}
+	contextBuilder.WriteString(string(deployContent))
+	contextBuilder.WriteString("\n\n")
+	
+	// Load project-types.md
+	projectTypesContent, err := embeddedContexts.ReadFile("contexts/project-types.md")
+	if err != nil {
+		return "", fmt.Errorf("failed to load project-types.md: %v", err)
+	}
+	contextBuilder.WriteString(string(projectTypesContent))
+	contextBuilder.WriteString("\n\n")
+	
+	// Load app-specs.md
+	appSpecsContent, err := embeddedContexts.ReadFile("contexts/app-specs.md")
+	if err != nil {
+		return "", fmt.Errorf("failed to load app-specs.md: %v", err)
+	}
+	contextBuilder.WriteString(string(appSpecsContent))
+	
+	return contextBuilder.String(), nil
+}
+
+func (m *ChatModel) analyzeCurrentProject() (string, error) {
+	var analysis strings.Builder
+	
+	// Get current working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current directory: %v", err)
+	}
+	
+	analysis.WriteString(fmt.Sprintf("**Directory**: %s\n", filepath.Base(cwd)))
+	analysis.WriteString(fmt.Sprintf("**Full Path**: %s\n\n", cwd))
+	
+	// Analyze project files
+	files, err := os.ReadDir(cwd)
+	if err != nil {
+		return "", fmt.Errorf("failed to read directory: %v", err)
+	}
+	
+	var projectFiles []string
+	var configFiles []string
+	var hasDockerfile bool
+	var detectedType string
+	
+	for _, file := range files {
+		name := file.Name()
+		projectFiles = append(projectFiles, name)
+		
+		// Detect project type
+		switch name {
+		case "go.mod":
+			detectedType = "Go"
+			configFiles = append(configFiles, name)
+		case "package.json":
+			if detectedType == "" {
+				detectedType = "Node.js"
+			}
+			configFiles = append(configFiles, name)
+		case "requirements.txt", "Pipfile", "pyproject.toml":
+			if detectedType == "" {
+				detectedType = "Python"
+			}
+			configFiles = append(configFiles, name)
+		case "Dockerfile":
+			hasDockerfile = true
+			configFiles = append(configFiles, name)
+		case ".env", ".env.example":
+			configFiles = append(configFiles, name)
+		}
+	}
+	
+	// Determine final project type
+	if hasDockerfile {
+		detectedType = "Docker"
+	}
+	if detectedType == "" {
+		detectedType = "Unknown"
+	}
+	
+	analysis.WriteString(fmt.Sprintf("**Detected Type**: %s\n", detectedType))
+	analysis.WriteString(fmt.Sprintf("**Config Files**: %s\n", strings.Join(configFiles, ", ")))
+	
+	// Read key config files for more details
+	if detectedType == "Go" {
+		if goModContent, err := os.ReadFile("go.mod"); err == nil {
+			lines := strings.Split(string(goModContent), "\n")
+			if len(lines) > 0 && strings.HasPrefix(lines[0], "module ") {
+				moduleName := strings.TrimSpace(strings.TrimPrefix(lines[0], "module "))
+				analysis.WriteString(fmt.Sprintf("**Go Module**: %s\n", moduleName))
+			}
+		}
+	}
+	
+	if detectedType == "Node.js" {
+		if pkgContent, err := os.ReadFile("package.json"); err == nil {
+			var pkg map[string]interface{}
+			if json.Unmarshal(pkgContent, &pkg) == nil {
+				if name, ok := pkg["name"].(string); ok {
+					analysis.WriteString(fmt.Sprintf("**Package Name**: %s\n", name))
+				}
+				if scripts, ok := pkg["scripts"].(map[string]interface{}); ok {
+					var scriptNames []string
+					for script := range scripts {
+						scriptNames = append(scriptNames, script)
+					}
+					analysis.WriteString(fmt.Sprintf("**NPM Scripts**: %s\n", strings.Join(scriptNames, ", ")))
+				}
+			}
+		}
+	}
+	
+	// Check for environment variables
+	if envContent, err := os.ReadFile(".env.example"); err == nil {
+		envVars := m.extractEnvVars(string(envContent))
+		if len(envVars) > 0 {
+			analysis.WriteString(fmt.Sprintf("**Environment Variables**: %s\n", strings.Join(envVars, ", ")))
+		}
+	} else if envContent, err := os.ReadFile(".env"); err == nil {
+		envVars := m.extractEnvVars(string(envContent))
+		if len(envVars) > 0 {
+			analysis.WriteString(fmt.Sprintf("**Environment Variables**: %s\n", strings.Join(envVars, ", ")))
+		}
+	}
+	
+	return analysis.String(), nil
+}
+
+func (m *ChatModel) extractEnvVars(content string) []string {
+	var vars []string
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if idx := strings.Index(line, "="); idx > 0 {
+			varName := strings.TrimSpace(line[:idx])
+			vars = append(vars, varName)
+		}
+	}
+	return vars
 }
 
 func main() {

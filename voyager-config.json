@@ -14,7 +14,8 @@
   "default_model": "llama3.3-70b-instruct",
   "default_provider": "digitalocean",
   "auto_start_mcps": [
-    "digitalocean"
+    "digitalocean",
+    "filesystem"
   ],
   "mcp_servers": {
     "digitalocean": {
@@ -29,6 +30,17 @@
       "env": [
         "DIGITALOCEAN_API_TOKEN=${DIGITALOCEAN_API_TOKEN}"
       ],
+      "active": false
+    },
+    "filesystem": {
+      "name": "filesystem",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/Users/paryan/dev/digitalocean/poc/voyager"
+      ],
+      "env": [],
       "active": false
     }
   }
