@@ -24,7 +24,7 @@
         "-y",
         "@digitalocean/mcp",
         "--services",
-        "apps,databases"
+        "apps"
       ],
       "env": [
         "DIGITALOCEAN_API_TOKEN=${DIGITALOCEAN_API_TOKEN}"

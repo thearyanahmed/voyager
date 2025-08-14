@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -111,6 +112,65 @@ type JSONRPCError struct {
 	Message string `json:"message"`
 }
 
+// Orchestrator types for feedback loops
+type OrchestratorStep struct {
+	ID          string                 `json:"id"`
+	Type        string                 `json:"type"`        // "mcp", "llm", "condition", "transform"
+	Action      string                 `json:"action"`      // tool name, prompt template, or condition
+	Input       interface{}            `json:"input,omitempty"`
+	Condition   string                 `json:"condition,omitempty"`   // for conditional steps
+	NextStep    map[string]string      `json:"next_step,omitempty"`   // conditional routing: {"success": "step2", "error": "step3"}
+	Transform   string                 `json:"transform,omitempty"`   // data transformation template
+	Timeout     time.Duration          `json:"timeout,omitempty"`     // step-specific timeout
+	Parallel    bool                   `json:"parallel,omitempty"`    // can run in parallel
+}
+
+type OrchestratorPipeline struct {
+	Name        string                 `json:"name"`
+	Steps       map[string]OrchestratorStep `json:"steps"`
+	StartStep   string                 `json:"start_step"`
+	Context     map[string]interface{} `json:"context,omitempty"`
+	MaxSteps    int                    `json:"max_steps,omitempty"`    // prevent infinite loops
+	GlobalTimeout time.Duration        `json:"global_timeout,omitempty"` // 3 minutes default
+}
+
+type ExecutionContext struct {
+	Variables       map[string]interface{}
+	History         []StepResult
+	CurrentStep     string
+	StepCount       int
+	StartTime       time.Time
+	MaxSteps        int
+	GlobalTimeout   time.Duration
+	RateLimiter     *time.Ticker
+	LastCallTime    time.Time
+}
+
+type StepResult struct {
+	StepID      string      `json:"step_id"`
+	Type        string      `json:"type"`
+	Success     bool        `json:"success"`
+	Output      interface{} `json:"output"`
+	Error       error       `json:"error,omitempty"`
+	Duration    time.Duration `json:"duration"`
+	Timestamp   time.Time   `json:"timestamp"`
+}
+
+type OrchestratorState struct {
+	Pipeline    *OrchestratorPipeline
+	Context     *ExecutionContext
+	Status      string // "running", "completed", "failed", "timeout"
+	CurrentStep string
+	Results     []StepResult
+}
+
+// For pending MCP format operations
+type MCPFormatData struct {
+	ToolName string
+	Data     interface{}
+	KeyMap   map[string]string
+}
+
 // Styles for the TUI
 var (
 	titleStyle = lipgloss.NewStyle().
@@ -187,6 +247,12 @@ type ChatModel struct {
 	toolCallStep       string
 	toolCallData       interface{}
 	toolCallStepIndex  int
+	
+	// Orchestrator state
+	orchestratorState  *OrchestratorState
+	
+	// Pending MCP formatting
+	pendingMCPFormat   *MCPFormatData
 }
 
 type responseMsg struct {
@@ -197,6 +263,11 @@ type responseMsg struct {
 type toolCallStepMsg struct {
 	step string
 	data interface{}
+}
+
+type orchestratorStepMsg struct {
+	stepID string
+	result *StepResult
 }
 
 type tickMsg time.Time
@@ -409,6 +480,12 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = fmt.Errorf("received empty response from API")
 		} else {
 			m.debugLog("SUCCESS", "Received API response (%d chars)", len(msg.content))
+			
+			// Check if this is a response to MCP field analysis
+			if m.pendingMCPFormat != nil {
+				return m.processMCPFieldAnalysis(msg.content)
+			}
+			
 			assistantMsg := Message{
 				Role:      "assistant",
 				Content:   msg.content,
@@ -421,6 +498,9 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		
 	case toolCallStepMsg:
 		return m.processToolCallStep()
+		
+	case orchestratorStepMsg:
+		return m.handleStepResult(msg.result)
 	}
 
 	return m, tea.Batch(tiCmd, vpCmd)
@@ -537,7 +617,9 @@ func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 /mcp stop <server> - Stop MCP server
 /mcp list - List MCP servers
 /mcp tools - List available MCP tools
-/mcp call <tool> [args] - Call MCP tool
+/mcp call <tool> [args] - Call MCP tool (formatted output)
+/mcp raw <tool> [args] - Call MCP tool (raw JSON output)
+/orchestrate <pipeline-json> - Execute orchestrator pipeline
 /help - Show this help
 /quit - Exit voyager
 
@@ -558,13 +640,46 @@ Esc - Quit`
 		if len(parts) < 2 {
 			systemMsg := Message{
 				Role:      "system",
-				Content:   "MCP commands: /mcp start <server>, /mcp stop <server>, /mcp list, /mcp tools, /mcp call <tool> [args...]",
+				Content:   "MCP commands: /mcp start <server>, /mcp stop <server>, /mcp list, /mcp tools, /mcp call <tool> [args], /mcp raw <tool> [args]",
 				Timestamp: time.Now(),
 			}
 			m.conversation = append(m.conversation, systemMsg)
 			m.updateViewport()
 		} else {
 			return m.handleMCPCommand(parts[1:])
+		}
+
+	case "orchestrate":
+		if len(parts) < 2 {
+			systemMsg := Message{
+				Role:      "system",
+				Content:   "Usage: /orchestrate <pipeline-json>",
+				Timestamp: time.Now(),
+			}
+			m.conversation = append(m.conversation, systemMsg)
+			m.updateViewport()
+		} else {
+			// Parse pipeline JSON from remaining arguments
+			pipelineJSON := strings.Join(parts[1:], " ")
+			var pipeline OrchestratorPipeline
+			if err := json.Unmarshal([]byte(pipelineJSON), &pipeline); err != nil {
+				systemMsg := Message{
+					Role:      "system",
+					Content:   fmt.Sprintf("Failed to parse pipeline JSON: %v", err),
+					Timestamp: time.Now(),
+				}
+				m.conversation = append(m.conversation, systemMsg)
+				m.updateViewport()
+			} else {
+				// Add user message showing the orchestrate command
+				userMsg := Message{
+					Role:      "user",
+					Content:   fmt.Sprintf("/orchestrate %s", pipeline.Name),
+					Timestamp: time.Now(),
+				}
+				m.conversation = append(m.conversation, userMsg)
+				return m.startOrchestrator(&pipeline)
+			}
 		}
 
 	case "quit", "exit":
@@ -638,7 +753,7 @@ func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 		Model:       m.currentModel,
 		Messages:    apiMessages,
 		Temperature: 0.7,
-		MaxTokens:   4000,
+		MaxTokens:   8000,
 	}
 
 	requestBody, err := json.Marshal(request)
@@ -867,8 +982,63 @@ func (m *ChatModel) handleMCPCommand(parts []string) (tea.Model, tea.Cmd) {
 					}
 					m.conversation = append(m.conversation, systemMsg)
 				} else {
-					// Start the interactive tool call process
-					return m.startToolCallProcess(toolName, arguments, result)
+					// Use smart formatting with LLM-assisted field prioritization
+					return m.formatMCPResponseWithLLM(toolName, result)
+				}
+			}
+		}
+
+	case "raw":
+		if len(parts) < 2 {
+			systemMsg := Message{
+				Role:      "system",
+				Content:   "Usage: /mcp raw <tool-name> [arguments-as-json]",
+				Timestamp: time.Now(),
+			}
+			m.conversation = append(m.conversation, systemMsg)
+		} else {
+			toolName := parts[1]
+			var arguments map[string]interface{}
+
+			if len(parts) > 2 {
+				jsonArg := strings.Join(parts[2:], " ")
+				if err := json.Unmarshal([]byte(jsonArg), &arguments); err != nil {
+					systemMsg := Message{
+						Role:      "system",
+						Content:   fmt.Sprintf("Failed to parse arguments: %v", err),
+						Timestamp: time.Now(),
+					}
+					m.conversation = append(m.conversation, systemMsg)
+					break
+				}
+			}
+
+			client := m.getMCPClientForTool(toolName)
+			if client == nil {
+				systemMsg := Message{
+					Role:      "system",
+					Content:   fmt.Sprintf("Tool '%s' not found in any active MCP server", toolName),
+					Timestamp: time.Now(),
+				}
+				m.conversation = append(m.conversation, systemMsg)
+			} else {
+				result, err := client.callTool(toolName, arguments)
+				if err != nil {
+					systemMsg := Message{
+						Role:      "system",
+						Content:   fmt.Sprintf("Failed to call tool '%s': %v", toolName, err),
+						Timestamp: time.Now(),
+					}
+					m.conversation = append(m.conversation, systemMsg)
+				} else {
+					// Show raw JSON result
+					resultJSON, _ := json.MarshalIndent(result, "", "  ")
+					systemMsg := Message{
+						Role:      "assistant",
+						Content:   fmt.Sprintf("**Raw JSON result from %s:**\n\n```json\n%s\n```", toolName, string(resultJSON)),
+						Timestamp: time.Now(),
+					}
+					m.conversation = append(m.conversation, systemMsg)
 				}
 			}
 		}
@@ -1060,6 +1230,1004 @@ func (m ChatModel) finishToolCall() (tea.Model, tea.Cmd) {
 	
 	m.updateViewport()
 	return m, m.sendMessage()
+}
+
+// Orchestrator implementation
+func (m *ChatModel) startOrchestrator(pipeline *OrchestratorPipeline) (tea.Model, tea.Cmd) {
+	// Initialize execution context
+	context := &ExecutionContext{
+		Variables:     make(map[string]interface{}),
+		History:       []StepResult{},
+		CurrentStep:   pipeline.StartStep,
+		StepCount:     0,
+		StartTime:     time.Now(),
+		MaxSteps:      pipeline.MaxSteps,
+		GlobalTimeout: pipeline.GlobalTimeout,
+		RateLimiter:   time.NewTicker(100 * time.Millisecond), // 10 calls per second max
+		LastCallTime:  time.Now(),
+	}
+	
+	// Set defaults
+	if context.MaxSteps == 0 {
+		context.MaxSteps = 50 // prevent infinite loops
+	}
+	if context.GlobalTimeout == 0 {
+		context.GlobalTimeout = 3 * time.Minute
+	}
+	
+	// Copy initial context variables
+	for k, v := range pipeline.Context {
+		context.Variables[k] = v
+	}
+	
+	// Initialize orchestrator state
+	m.orchestratorState = &OrchestratorState{
+		Pipeline:    pipeline,
+		Context:     context,
+		Status:      "running",
+		CurrentStep: pipeline.StartStep,
+		Results:     []StepResult{},
+	}
+	
+	m.debugLog("ORCHESTRATOR", "Starting pipeline '%s' with %d steps", pipeline.Name, len(pipeline.Steps))
+	
+	// Start the first step
+	return m.executeCurrentStep()
+}
+
+func (m ChatModel) executeCurrentStep() (tea.Model, tea.Cmd) {
+	if m.orchestratorState == nil {
+		return m, nil
+	}
+	
+	state := m.orchestratorState
+	context := state.Context
+	
+	// Check global timeout
+	if time.Since(context.StartTime) > context.GlobalTimeout {
+		return m.finishOrchestrator("timeout", "Global timeout exceeded")
+	}
+	
+	// Check max steps
+	if context.StepCount >= context.MaxSteps {
+		return m.finishOrchestrator("failed", "Maximum steps exceeded")
+	}
+	
+	// Get current step
+	step, exists := state.Pipeline.Steps[context.CurrentStep]
+	if !exists {
+		return m.finishOrchestrator("failed", fmt.Sprintf("Step '%s' not found", context.CurrentStep))
+	}
+	
+	// Rate limiting - wait if needed
+	<-context.RateLimiter.C
+	
+	m.debugLog("ORCHESTRATOR", "Executing step '%s' (type: %s)", step.ID, step.Type)
+	context.StepCount++
+	
+	// Execute step based on type
+	return m.executeStep(&step)
+}
+
+func (m ChatModel) executeStep(step *OrchestratorStep) (tea.Model, tea.Cmd) {
+	startTime := time.Now()
+	
+	switch step.Type {
+	case "mcp":
+		return m.executeMCPStep(step, startTime)
+	case "llm":
+		return m.executeLLMStep(step, startTime)
+	case "condition":
+		return m.executeConditionStep(step, startTime)
+	case "transform":
+		return m.executeTransformStep(step, startTime)
+	default:
+		result := &StepResult{
+			StepID:    step.ID,
+			Type:      step.Type,
+			Success:   false,
+			Error:     fmt.Errorf("unknown step type: %s", step.Type),
+			Duration:  time.Since(startTime),
+			Timestamp: time.Now(),
+		}
+		return m.handleStepResult(result)
+	}
+}
+
+func (m ChatModel) executeMCPStep(step *OrchestratorStep, startTime time.Time) (tea.Model, tea.Cmd) {
+	// Parse arguments from step input or context
+	var arguments map[string]interface{}
+	if step.Input != nil {
+		if args, ok := step.Input.(map[string]interface{}); ok {
+			arguments = args
+		}
+	}
+	
+	// Apply context variable substitution
+	arguments = m.applyContextSubstitution(arguments)
+	
+	// Find MCP client for the tool
+	client := m.getMCPClientForTool(step.Action)
+	if client == nil {
+		result := &StepResult{
+			StepID:    step.ID,
+			Type:      step.Type,
+			Success:   false,
+			Error:     fmt.Errorf("MCP tool '%s' not found", step.Action),
+			Duration:  time.Since(startTime),
+			Timestamp: time.Now(),
+		}
+		return m.handleStepResult(result)
+	}
+	
+	// Execute MCP call asynchronously
+	return m, func() tea.Msg {
+		output, err := client.callTool(step.Action, arguments)
+		result := &StepResult{
+			StepID:    step.ID,
+			Type:      step.Type,
+			Success:   err == nil,
+			Output:    output,
+			Error:     err,
+			Duration:  time.Since(startTime),
+			Timestamp: time.Now(),
+		}
+		return orchestratorStepMsg{stepID: step.ID, result: result}
+	}
+}
+
+func (m ChatModel) executeLLMStep(step *OrchestratorStep, startTime time.Time) (tea.Model, tea.Cmd) {
+	// Build prompt with context substitution
+	prompt := m.applyStringSubstitution(step.Action)
+	
+	// Add to conversation for LLM call
+	tempMsg := Message{
+		Role:      "user",
+		Content:   prompt,
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, tempMsg)
+	
+	// Make LLM call asynchronously
+	return m, func() tea.Msg {
+		response, err := m.makeAPIRequest()
+		result := &StepResult{
+			StepID:    step.ID,
+			Type:      step.Type,
+			Success:   err == nil,
+			Output:    response,
+			Error:     err,
+			Duration:  time.Since(startTime),
+			Timestamp: time.Now(),
+		}
+		return orchestratorStepMsg{stepID: step.ID, result: result}
+	}
+}
+
+func (m ChatModel) executeConditionStep(step *OrchestratorStep, startTime time.Time) (tea.Model, tea.Cmd) {
+	// Evaluate condition against context
+	conditionResult := m.evaluateCondition(step.Condition)
+	
+	result := &StepResult{
+		StepID:    step.ID,
+		Type:      step.Type,
+		Success:   true,
+		Output:    conditionResult,
+		Duration:  time.Since(startTime),
+		Timestamp: time.Now(),
+	}
+	
+	return m.handleStepResult(result)
+}
+
+func (m ChatModel) executeTransformStep(step *OrchestratorStep, startTime time.Time) (tea.Model, tea.Cmd) {
+	// Apply transformation to context data
+	transformed := m.applyTransformation(step.Transform)
+	
+	result := &StepResult{
+		StepID:    step.ID,
+		Type:      step.Type,
+		Success:   true,
+		Output:    transformed,
+		Duration:  time.Since(startTime),
+		Timestamp: time.Now(),
+	}
+	
+	return m.handleStepResult(result)
+}
+
+func (m ChatModel) handleStepResult(result *StepResult) (tea.Model, tea.Cmd) {
+	if m.orchestratorState == nil {
+		return m, nil
+	}
+	
+	// Add result to history
+	m.orchestratorState.Context.History = append(m.orchestratorState.Context.History, *result)
+	m.orchestratorState.Results = append(m.orchestratorState.Results, *result)
+	
+	// Update context variables with result
+	m.orchestratorState.Context.Variables[result.StepID] = result.Output
+	m.orchestratorState.Context.Variables["last_result"] = result.Output
+	m.orchestratorState.Context.Variables["last_success"] = result.Success
+	
+	m.debugLog("ORCHESTRATOR", "Step '%s' completed (success: %v, duration: %v)", 
+		result.StepID, result.Success, result.Duration)
+	
+	// Determine next step
+	nextStep := m.determineNextStep(result)
+	if nextStep == "" || nextStep == "end" {
+		return m.finishOrchestrator("completed", "Pipeline completed successfully")
+	}
+	
+	// Update current step and continue
+	m.orchestratorState.Context.CurrentStep = nextStep
+	m.orchestratorState.CurrentStep = nextStep
+	
+	return m.executeCurrentStep()
+}
+
+func (m ChatModel) determineNextStep(result *StepResult) string {
+	step := m.orchestratorState.Pipeline.Steps[result.StepID]
+	
+	if len(step.NextStep) == 0 {
+		return "end"
+	}
+	
+	// Check for conditional routing
+	if result.Success {
+		if next, exists := step.NextStep["success"]; exists {
+			return next
+		}
+	} else {
+		if next, exists := step.NextStep["error"]; exists {
+			return next
+		}
+	}
+	
+	// Default routing
+	if next, exists := step.NextStep["default"]; exists {
+		return next
+	}
+	
+	return "end"
+}
+
+func (m ChatModel) finishOrchestrator(status, message string) (tea.Model, tea.Cmd) {
+	if m.orchestratorState != nil {
+		m.orchestratorState.Status = status
+		
+		// Cleanup
+		if m.orchestratorState.Context.RateLimiter != nil {
+			m.orchestratorState.Context.RateLimiter.Stop()
+		}
+		
+		duration := time.Since(m.orchestratorState.Context.StartTime)
+		m.debugLog("ORCHESTRATOR", "Pipeline finished: %s (%v, %d steps)", 
+			status, duration, m.orchestratorState.Context.StepCount)
+		
+		// Add result to conversation
+		resultMsg := Message{
+			Role:      "assistant",
+			Content:   m.formatOrchestratorResults(status, message),
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, resultMsg)
+		
+		// Reset state
+		m.orchestratorState = nil
+	}
+	
+	m.updateViewport()
+	return m, nil
+}
+
+// Helper methods for context management and evaluation
+func (m ChatModel) applyContextSubstitution(data map[string]interface{}) map[string]interface{} {
+	if m.orchestratorState == nil || data == nil {
+		return data
+	}
+	
+	result := make(map[string]interface{})
+	for k, v := range data {
+		if str, ok := v.(string); ok {
+			result[k] = m.applyStringSubstitution(str)
+		} else {
+			result[k] = v
+		}
+	}
+	return result
+}
+
+func (m ChatModel) applyStringSubstitution(template string) string {
+	if m.orchestratorState == nil {
+		return template
+	}
+	
+	// Simple template substitution - replace {{.variable}} with context values
+	result := template
+	for key, value := range m.orchestratorState.Context.Variables {
+		placeholder := fmt.Sprintf("{{.%s}}", key)
+		if str, ok := value.(string); ok {
+			result = strings.ReplaceAll(result, placeholder, str)
+		}
+	}
+	return result
+}
+
+func (m ChatModel) evaluateCondition(condition string) bool {
+	// Simple condition evaluation - can be extended
+	if condition == "" {
+		return true
+	}
+	
+	// Example: "last_success == true"
+	if strings.Contains(condition, "last_success") {
+		if success, exists := m.orchestratorState.Context.Variables["last_success"]; exists {
+			return success.(bool)
+		}
+	}
+	
+	return true
+}
+
+func (m ChatModel) applyTransformation(transform string) interface{} {
+	// Simple transformation - can be extended
+	return m.applyStringSubstitution(transform)
+}
+
+func (m ChatModel) formatOrchestratorResults(status, message string) string {
+	if m.orchestratorState == nil {
+		return fmt.Sprintf("Orchestrator finished: %s - %s", status, message)
+	}
+	
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("🔄 Orchestrator Pipeline: %s\n", m.orchestratorState.Pipeline.Name))
+	result.WriteString(fmt.Sprintf("Status: %s\n", status))
+	result.WriteString(fmt.Sprintf("Duration: %v\n", time.Since(m.orchestratorState.Context.StartTime)))
+	result.WriteString(fmt.Sprintf("Steps executed: %d\n\n", m.orchestratorState.Context.StepCount))
+	
+	if len(m.orchestratorState.Results) > 0 {
+		result.WriteString("Step Results:\n")
+		for _, res := range m.orchestratorState.Results {
+			status := "✅"
+			if !res.Success {
+				status = "❌"
+			}
+			result.WriteString(fmt.Sprintf("%s %s (%s) - %v\n", status, res.StepID, res.Type, res.Duration))
+		}
+	}
+	
+	return result.String()
+}
+
+// LLM-assisted formatting for MCP tool results
+func (m ChatModel) formatMCPResponseWithLLM(toolName string, result interface{}) (tea.Model, tea.Cmd) {
+	// First, extract the actual data from MCP response format
+	actualData := m.extractMCPContent(result)
+	
+	// Get a flat map of all available keys
+	keyMap := m.extractAllKeys(actualData)
+	
+	if len(keyMap) == 0 {
+		// Fallback to simple formatting
+		formattedResult := m.formatMCPResponse(toolName, actualData)
+		systemMsg := Message{
+			Role:      "assistant",
+			Content:   formattedResult,
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, systemMsg)
+		m.updateViewport()
+		return m, nil
+	}
+	
+	// Create prompt for LLM to analyze field importance
+	keysJSON, _ := json.Marshal(keyMap)
+	prompt := fmt.Sprintf(`I have data from a "%s" API call with the following fields: %s
+
+Please analyze these fields and respond with ONLY a JSON array of the 5 most important/useful fields for displaying to a user, ordered by importance (most important first).
+
+Consider:
+- User-friendly identifiers (name, title, id)
+- Status/state information  
+- Key descriptive fields (url, description, type)
+- Important metadata (date, size, count)
+
+Example response format: ["name", "status", "url", "id", "created_at"]
+
+Response:`, toolName, string(keysJSON))
+	
+	// Add the analysis request to conversation
+	analysisMsg := Message{
+		Role:      "user", 
+		Content:   prompt,
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, analysisMsg)
+	
+	// Store the data for later formatting
+	m.pendingMCPFormat = &MCPFormatData{
+		ToolName: toolName,
+		Data:     actualData,
+		KeyMap:   keyMap,
+	}
+	
+	// Trigger LLM call to get field priorities
+	m.loading = true
+	m.updateViewport()
+	return m, m.sendMessage()
+}
+
+// Extract actual content from MCP response wrapper
+func (m *ChatModel) extractMCPContent(result interface{}) interface{} {
+	// Handle MCP response format with "content" field
+	if resultMap, ok := result.(map[string]interface{}); ok {
+		if content, exists := resultMap["content"]; exists {
+			// If content is an array with text field
+			if contentArray, ok := content.([]interface{}); ok && len(contentArray) > 0 {
+				if firstContent, ok := contentArray[0].(map[string]interface{}); ok {
+					if text, exists := firstContent["text"]; exists {
+						// Try to parse the text as JSON
+						if textStr, ok := text.(string); ok {
+							var parsed interface{}
+							if json.Unmarshal([]byte(textStr), &parsed) == nil {
+								return parsed
+							}
+							return textStr
+						}
+					}
+				}
+			}
+			return content
+		}
+	}
+	return result
+}
+
+// Extract all unique keys from nested data structure
+func (m *ChatModel) extractAllKeys(data interface{}) map[string]string {
+	keyMap := make(map[string]string)
+	m.extractKeysRecursive(data, keyMap, "")
+	return keyMap
+}
+
+func (m *ChatModel) extractKeysRecursive(data interface{}, keyMap map[string]string, prefix string) {
+	switch v := data.(type) {
+	case map[string]interface{}:
+		for key, value := range v {
+			fullKey := key
+			if prefix != "" {
+				fullKey = prefix + "." + key
+			}
+			
+			// Add sample value for LLM to understand the field
+			sampleValue := m.getSampleValue(value)
+			keyMap[fullKey] = sampleValue
+			
+			// Recursively extract nested keys (but limit depth)
+			if len(strings.Split(fullKey, ".")) < 3 {
+				m.extractKeysRecursive(value, keyMap, fullKey)
+			}
+		}
+	case []interface{}:
+		if len(v) > 0 {
+			// Analyze first item in array
+			m.extractKeysRecursive(v[0], keyMap, prefix)
+		}
+	}
+}
+
+func (m *ChatModel) getSampleValue(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		if len(v) > 50 {
+			return v[:50] + "..."
+		}
+		return v
+	case int, int64, float64, bool:
+		return fmt.Sprintf("%v", v)
+	case []interface{}:
+		return fmt.Sprintf("array[%d]", len(v))
+	case map[string]interface{}:
+		return "object"
+	case nil:
+		return "null"
+	default:
+		return "complex"
+	}
+}
+
+// Format data using LLM-determined field priorities
+func (m ChatModel) formatWithLLMPriorities(toolName string, data interface{}, priorityFields []string) string {
+	switch actualData := data.(type) {
+	case []interface{}:
+		return m.formatArrayWithPriorities(toolName, actualData, priorityFields)
+	case map[string]interface{}:
+		return m.formatMapWithPriorities(toolName, actualData, priorityFields)
+	default:
+		return m.formatMCPResponse(toolName, data)
+	}
+}
+
+func (m *ChatModel) formatArrayWithPriorities(toolName string, data []interface{}, priorityFields []string) string {
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("## %s Results\n\n", strings.Title(strings.ReplaceAll(toolName, "-", " "))))
+	
+	if len(data) == 0 {
+		result.WriteString("*No results found*\n")
+		return result.String()
+	}
+	
+	// Use table format with priority fields
+	result.WriteString("|")
+	for _, field := range priorityFields {
+		result.WriteString(fmt.Sprintf(" %s |", strings.Title(strings.ReplaceAll(field, "_", " "))))
+	}
+	result.WriteString("\n")
+	
+	// Separator
+	result.WriteString("|")
+	for range priorityFields {
+		result.WriteString("-------|")
+	}
+	result.WriteString("\n")
+	
+	// Data rows
+	for _, item := range data {
+		if itemMap, ok := item.(map[string]interface{}); ok {
+			result.WriteString("|")
+			for _, field := range priorityFields {
+				value := ""
+				if val, exists := itemMap[field]; exists {
+					value = m.simpleStringValue(val)
+					if len(value) > 30 {
+						value = value[:27] + "..."
+					}
+				}
+				result.WriteString(fmt.Sprintf(" %s |", value))
+			}
+			result.WriteString("\n")
+		}
+	}
+	
+	return result.String()
+}
+
+func (m *ChatModel) formatMapWithPriorities(toolName string, data map[string]interface{}, priorityFields []string) string {
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("## %s Results\n\n", strings.Title(strings.ReplaceAll(toolName, "-", " "))))
+	
+	result.WriteString("| Field | Value |\n")
+	result.WriteString("|-------|-------|\n")
+	
+	for _, field := range priorityFields {
+		if value, exists := data[field]; exists {
+			strValue := m.simpleStringValue(value)
+			if strValue != "" {
+				result.WriteString(fmt.Sprintf("| %s | %s |\n", 
+					strings.Title(strings.ReplaceAll(field, "_", " ")), strValue))
+			}
+		}
+	}
+	
+	return result.String()
+}
+
+// Smart response formatter for MCP tool results
+func (m *ChatModel) formatMCPResponse(toolName string, result interface{}) string {
+	// First, try to detect the data structure and format appropriately
+	switch data := result.(type) {
+	case map[string]interface{}:
+		return m.formatMCPMapResponse(toolName, data)
+	case []interface{}:
+		return m.formatMCPArrayResponse(toolName, data)
+	default:
+		// Fallback to simple string representation
+		if str, ok := result.(string); ok {
+			return m.formatMCPStringResponse(toolName, str)
+		}
+		// For complex types, convert to JSON and format
+		if jsonBytes, err := json.Marshal(result); err == nil {
+			var parsed interface{}
+			if json.Unmarshal(jsonBytes, &parsed) == nil {
+				return m.formatMCPResponse(toolName, parsed)
+			}
+		}
+		return fmt.Sprintf("**%s Result:**\n%v", toolName, result)
+	}
+}
+
+func (m *ChatModel) formatMCPMapResponse(toolName string, data map[string]interface{}) string {
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("## %s Results\n\n", strings.Title(strings.ReplaceAll(toolName, "-", " "))))
+	
+	// Check if it contains a 'content' field (common MCP pattern)
+	if content, exists := data["content"]; exists {
+		return m.formatMCPResponse(toolName, content)
+	}
+	
+	// Check if it's a list-like structure
+	if items, exists := data["items"]; exists {
+		return m.formatMCPResponse(toolName, items)
+	}
+	
+	// Check for common array fields
+	for key, value := range data {
+		if arr, ok := value.([]interface{}); ok {
+			if len(arr) > 0 {
+				result.WriteString(fmt.Sprintf("### %s\n", strings.Title(key)))
+				result.WriteString(m.formatMCPArrayResponse("", arr))
+				result.WriteString("\n")
+			}
+		}
+	}
+	
+	// If no arrays found, format as key-value pairs
+	if result.Len() == len(fmt.Sprintf("## %s Results\n\n", strings.Title(strings.ReplaceAll(toolName, "-", " ")))) {
+		result.WriteString("| Field | Value |\n")
+		result.WriteString("|-------|-------|\n")
+		
+		for key, value := range data {
+			// Skip complex nested objects for simple table view
+			if str := m.simpleStringValue(value); str != "" {
+				result.WriteString(fmt.Sprintf("| %s | %s |\n", strings.Title(key), str))
+			}
+		}
+	}
+	
+	return result.String()
+}
+
+func (m *ChatModel) formatMCPArrayResponse(toolName string, data []interface{}) string {
+	var result strings.Builder
+	
+	if toolName != "" {
+		result.WriteString(fmt.Sprintf("## %s Results\n\n", strings.Title(strings.ReplaceAll(toolName, "-", " "))))
+	}
+	
+	if len(data) == 0 {
+		result.WriteString("*No results found*\n")
+		return result.String()
+	}
+	
+	// Check if all items are objects with similar structure (table format)
+	if m.canFormatAsTable(data) {
+		return result.String() + m.formatAsTable(data)
+	}
+	
+	// Check if items are simple values (numbered list)
+	if m.areSimpleValues(data) {
+		return result.String() + m.formatAsNumberedList(data)
+	}
+	
+	// Format as detailed list for complex objects
+	return result.String() + m.formatAsDetailedList(data)
+}
+
+func (m *ChatModel) formatMCPStringResponse(toolName string, data string) string {
+	// Try to parse as JSON first
+	var parsed interface{}
+	if json.Unmarshal([]byte(data), &parsed) == nil {
+		return m.formatMCPResponse(toolName, parsed)
+	}
+	
+	// Return as simple text
+	return fmt.Sprintf("**%s:**\n%s", strings.Title(strings.ReplaceAll(toolName, "-", " ")), data)
+}
+
+func (m *ChatModel) canFormatAsTable(data []interface{}) bool {
+	if len(data) == 0 {
+		return false
+	}
+	
+	// Check if first item is an object
+	firstItem, ok := data[0].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	
+	// Get keys from first item
+	firstKeys := make(map[string]bool)
+	for key := range firstItem {
+		firstKeys[key] = true
+	}
+	
+	// Check if other items have similar structure (at least 50% key overlap)
+	for _, item := range data[1:] {
+		if itemMap, ok := item.(map[string]interface{}); ok {
+			commonKeys := 0
+			for key := range itemMap {
+				if firstKeys[key] {
+					commonKeys++
+				}
+			}
+			// Require at least 50% common keys
+			if float64(commonKeys)/float64(len(firstKeys)) < 0.5 {
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+	
+	return len(data) <= 20 // Don't use tables for very long lists
+}
+
+func (m *ChatModel) formatAsTable(data []interface{}) string {
+	if len(data) == 0 {
+		return ""
+	}
+	
+	// Get all unique keys
+	allKeys := make(map[string]bool)
+	for _, item := range data {
+		if itemMap, ok := item.(map[string]interface{}); ok {
+			for key := range itemMap {
+				allKeys[key] = true
+			}
+		}
+	}
+	
+	// Convert to sorted slice
+	keys := make([]string, 0, len(allKeys))
+	for key := range allKeys {
+		keys = append(keys, key)
+	}
+	
+	// Prioritize common fields
+	priorityKeys := []string{"name", "id", "title", "type", "status", "url", "description"}
+	finalKeys := []string{}
+	
+	// Add priority keys first
+	for _, priority := range priorityKeys {
+		for _, key := range keys {
+			if strings.ToLower(key) == priority {
+				finalKeys = append(finalKeys, key)
+				break
+			}
+		}
+	}
+	
+	// Add remaining keys
+	for _, key := range keys {
+		found := false
+		for _, existing := range finalKeys {
+			if key == existing {
+				found = true
+				break
+			}
+		}
+		if !found {
+			finalKeys = append(finalKeys, key)
+		}
+	}
+	
+	// Limit columns to prevent overly wide tables
+	if len(finalKeys) > 5 {
+		finalKeys = finalKeys[:5]
+	}
+	
+	var result strings.Builder
+	
+	// Header
+	result.WriteString("|")
+	for _, key := range finalKeys {
+		result.WriteString(fmt.Sprintf(" %s |", strings.Title(key)))
+	}
+	result.WriteString("\n")
+	
+	// Separator
+	result.WriteString("|")
+	for range finalKeys {
+		result.WriteString("-------|")
+	}
+	result.WriteString("\n")
+	
+	// Rows
+	for _, item := range data {
+		if itemMap, ok := item.(map[string]interface{}); ok {
+			result.WriteString("|")
+			for _, key := range finalKeys {
+				value := ""
+				if val, exists := itemMap[key]; exists {
+					value = m.simpleStringValue(val)
+					// Limit cell content length
+					if len(value) > 30 {
+						value = value[:27] + "..."
+					}
+				}
+				result.WriteString(fmt.Sprintf(" %s |", value))
+			}
+			result.WriteString("\n")
+		}
+	}
+	
+	return result.String()
+}
+
+func (m *ChatModel) areSimpleValues(data []interface{}) bool {
+	for _, item := range data {
+		switch item.(type) {
+		case string, int, int64, float64, bool:
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (m *ChatModel) formatAsNumberedList(data []interface{}) string {
+	var result strings.Builder
+	
+	for i, item := range data {
+		result.WriteString(fmt.Sprintf("%d. %v\n", i+1, item))
+	}
+	
+	return result.String()
+}
+
+func (m *ChatModel) formatAsDetailedList(data []interface{}) string {
+	var result strings.Builder
+	
+	for i, item := range data {
+		result.WriteString(fmt.Sprintf("### %d. ", i+1))
+		
+		if itemMap, ok := item.(map[string]interface{}); ok {
+			// Try to find a title/name field
+			title := ""
+			for _, key := range []string{"name", "title", "id"} {
+				if val, exists := itemMap[key]; exists {
+					title = m.simpleStringValue(val)
+					break
+				}
+			}
+			
+			if title != "" {
+				result.WriteString(fmt.Sprintf("%s\n", title))
+			} else {
+				result.WriteString("Item\n")
+			}
+			
+			// Add key details
+			for key, value := range itemMap {
+				if key != "name" && key != "title" && key != "id" {
+					strVal := m.simpleStringValue(value)
+					if strVal != "" && len(strVal) < 100 {
+						result.WriteString(fmt.Sprintf("- **%s:** %s\n", strings.Title(key), strVal))
+					}
+				}
+			}
+		} else {
+			result.WriteString(fmt.Sprintf("%v\n", item))
+		}
+		
+		result.WriteString("\n")
+	}
+	
+	return result.String()
+}
+
+func (m *ChatModel) simpleStringValue(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case int, int64:
+		return fmt.Sprintf("%d", v)
+	case float64:
+		return fmt.Sprintf("%.2f", v)
+	case bool:
+		return fmt.Sprintf("%t", v)
+	case nil:
+		return ""
+	default:
+		// For complex types, don't include in simple view
+		return ""
+	}
+}
+
+// Process LLM response for MCP field analysis
+func (m ChatModel) processMCPFieldAnalysis(response string) (tea.Model, tea.Cmd) {
+	if m.pendingMCPFormat == nil {
+		return m, nil
+	}
+	
+	// Extract JSON array from LLM response
+	priorityFields := m.extractFieldPriorities(response)
+	
+	if len(priorityFields) == 0 {
+		m.debugLog("ERROR", "Could not parse field priorities from LLM response")
+		// Fallback to simple formatting
+		formattedResult := m.formatMCPResponse(m.pendingMCPFormat.ToolName, m.pendingMCPFormat.Data)
+		systemMsg := Message{
+			Role:      "assistant",
+			Content:   formattedResult,
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, systemMsg)
+	} else {
+		m.debugLog("SUCCESS", "Got field priorities: %v", priorityFields)
+		// Format using LLM-determined priorities
+		formattedResult := m.formatWithLLMPriorities(
+			m.pendingMCPFormat.ToolName, 
+			m.pendingMCPFormat.Data, 
+			priorityFields,
+		)
+		
+		systemMsg := Message{
+			Role:      "assistant",
+			Content:   formattedResult,
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, systemMsg)
+	}
+	
+	// Clear pending format data
+	m.pendingMCPFormat = nil
+	m.updateViewport()
+	return m, nil
+}
+
+// Extract field priorities from LLM response
+func (m *ChatModel) extractFieldPriorities(response string) []string {
+	// Try to find JSON array in the response
+	lines := strings.Split(response, "\n")
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			var fields []string
+			if err := json.Unmarshal([]byte(line), &fields); err == nil {
+				return fields
+			}
+		}
+	}
+	
+	// Try to find JSON array anywhere in the response (more flexible parsing)
+	start := strings.Index(response, "[")
+	end := strings.LastIndex(response, "]")
+	
+	if start >= 0 && end > start {
+		jsonStr := response[start : end+1]
+		var fields []string
+		if err := json.Unmarshal([]byte(jsonStr), &fields); err == nil {
+			return fields
+		}
+	}
+	
+	// If JSON parsing fails, try to extract field names manually
+	return m.extractFieldsManually(response)
+}
+
+// Fallback manual extraction of field names
+func (m *ChatModel) extractFieldsManually(response string) []string {
+	var fields []string
+	
+	// Look for quoted field names in the response
+	re := regexp.MustCompile(`"([a-zA-Z_][a-zA-Z0-9_]*)"`)
+	matches := re.FindAllStringSubmatch(response, -1)
+	
+	// Deduplicate and limit to 5 fields
+	seen := make(map[string]bool)
+	for _, match := range matches {
+		if len(match) > 1 {
+			field := match[1]
+			if !seen[field] && len(fields) < 5 {
+				// Verify this field exists in our key map
+				if m.pendingMCPFormat != nil {
+					for key := range m.pendingMCPFormat.KeyMap {
+						if key == field || strings.HasSuffix(key, "."+field) {
+							fields = append(fields, field)
+							seen[field] = true
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	return fields
 }
 
 func (m *ChatModel) stopMCPServer(serverName string) error {
@@ -1336,6 +2504,7 @@ func (m *ChatModel) debugLog(level string, message string, args ...interface{}) 
 		"AUTH":    "\033[95m", // Bright Magenta
 		"LOAD":    "\033[92m", // Bright Green
 		"SAVE":    "\033[94m", // Bright Blue
+		"ORCHESTRATOR": "\033[38;5;208m", // Orange
 	}
 	reset := "\033[0m"
 
