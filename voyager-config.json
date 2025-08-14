@@ -13,6 +13,9 @@
   },
   "default_model": "llama3.3-70b-instruct",
   "default_provider": "digitalocean",
+  "auto_start_mcps": [
+    "digitalocean"
+  ],
   "mcp_servers": {
     "digitalocean": {
       "name": "digitalocean",

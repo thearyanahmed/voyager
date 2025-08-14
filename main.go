@@ -42,6 +42,7 @@ type Config struct {
 	DefaultModel    string               `json:"default_model"`
 	DefaultProvider string               `json:"default_provider"`
 	MCPServers      map[string]MCPServer `json:"mcp_servers,omitempty"`
+	AutoStartMCPs   []string             `json:"auto_start_mcps,omitempty"`
 }
 
 // Message represents a chat message
@@ -258,6 +259,23 @@ func initialModel(config *Config, debugEnabled bool) ChatModel {
 		model_instance.debugLog("CONFIG", "Default provider: %s, model: %s", provider, model)
 		if len(config.MCPServers) > 0 {
 			model_instance.debugLog("CONFIG", "Found %d MCP servers configured", len(config.MCPServers))
+		}
+		if len(config.AutoStartMCPs) > 0 {
+			model_instance.debugLog("CONFIG", "Auto-starting %d MCP servers", len(config.AutoStartMCPs))
+		}
+	}
+
+	// Auto-start configured MCP servers
+	for _, serverName := range config.AutoStartMCPs {
+		if _, exists := config.MCPServers[serverName]; exists {
+			if debugEnabled {
+				model_instance.debugLog("MCP", "Auto-starting MCP server: %s", serverName)
+			}
+			go model_instance.startMCPServer(serverName)
+		} else {
+			if debugEnabled {
+				model_instance.debugLog("ERROR", "Auto-start MCP server '%s' not found in configuration", serverName)
+			}
 		}
 	}
 
