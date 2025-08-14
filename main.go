@@ -496,6 +496,11 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.processMCPFieldAnalysis(msg.content)
 			}
 			
+			// Check for tool calls in the response
+			if m.containsToolCalls(msg.content) {
+				return m.processToolCallResponse(msg.content)
+			}
+			
 			assistantMsg := Message{
 				Role:      "assistant",
 				Content:   msg.content,
@@ -511,6 +516,9 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		
 	case orchestratorStepMsg:
 		return m.handleStepResult(msg.result)
+		
+	case autoToolCallResult:
+		return m.handleAutoToolCallResult(msg)
 	}
 
 	return m, tea.Batch(tiCmd, vpCmd)
@@ -750,6 +758,16 @@ func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 
 	// Convert messages to API format (without timestamp)
 	var apiMessages []Message
+	
+	// Add system message with available MCP tools
+	toolsContext := m.buildToolsContext()
+	if toolsContext != "" {
+		apiMessages = append(apiMessages, Message{
+			Role:    "system",
+			Content: toolsContext,
+		})
+	}
+	
 	for _, msg := range m.conversation {
 		if msg.Role != "system" {
 			apiMessages = append(apiMessages, Message{
@@ -2314,6 +2332,187 @@ func (m *ChatModel) renderMarkdown(content string) string {
 	}
 	
 	return strings.TrimSpace(rendered)
+}
+
+// Build context about available MCP tools for the LLM
+func (m *ChatModel) buildToolsContext() string {
+	if len(m.mcpClients) == 0 {
+		return ""
+	}
+	
+	var context strings.Builder
+	context.WriteString("AVAILABLE TOOLS: You have access to the following MCP tools that can help answer questions:\n\n")
+	
+	toolCount := 0
+	for serverName, client := range m.mcpClients {
+		if len(client.Tools) > 0 {
+			context.WriteString(fmt.Sprintf("**%s Server:**\n", serverName))
+			for _, tool := range client.Tools {
+				context.WriteString(fmt.Sprintf("- `%s`: %s\n", tool.Name, tool.Description))
+				toolCount++
+			}
+			context.WriteString("\n")
+		}
+	}
+	
+	if toolCount == 0 {
+		return ""
+	}
+	
+	context.WriteString("USAGE INSTRUCTIONS:\n")
+	context.WriteString("- When users ask questions that could be answered using these tools, suggest using the tool\n")
+	context.WriteString("- Use format: \"I can help with that! Let me use the `tool-name` tool: [TOOL_CALL:tool-name:arguments]\"\n")
+	context.WriteString("- For questions about DigitalOcean apps/droplets/resources, use the appropriate digitalocean tools\n")
+	context.WriteString("- Always explain what the tool does before calling it\n\n")
+	
+	return context.String()
+}
+
+// Check if LLM response contains tool calls
+func (m *ChatModel) containsToolCalls(content string) bool {
+	re := regexp.MustCompile(`\[TOOL_CALL:([^:]+)(?::([^\]]*))?\]`)
+	return re.MatchString(content)
+}
+
+// Process LLM response that contains tool calls
+func (m ChatModel) processToolCallResponse(content string) (tea.Model, tea.Cmd) {
+	// First, add the LLM's response to conversation (without tool calls)
+	cleanContent := m.removeToolCallTags(content)
+	assistantMsg := Message{
+		Role:      "assistant",
+		Content:   cleanContent,
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, assistantMsg)
+	
+	// Extract and execute tool calls
+	toolCalls := m.extractToolCalls(content)
+	if len(toolCalls) == 0 {
+		m.updateViewport()
+		return m, nil
+	}
+	
+	// Execute the first tool call (we can extend this to handle multiple later)
+	toolCall := toolCalls[0]
+	m.debugLog("SUCCESS", "LLM suggested tool call: %s", toolCall.Name)
+	
+	// Execute the tool call
+	return m.executeAutoToolCall(toolCall)
+}
+
+// Remove tool call tags from content for display
+func (m *ChatModel) removeToolCallTags(content string) string {
+	re := regexp.MustCompile(`\[TOOL_CALL:[^\]]+\]`)
+	return re.ReplaceAllString(content, "")
+}
+
+// Extract tool calls from LLM response
+func (m *ChatModel) extractToolCalls(content string) []ToolCall {
+	var toolCalls []ToolCall
+	re := regexp.MustCompile(`\[TOOL_CALL:([^:]+)(?::([^\]]*))?\]`)
+	matches := re.FindAllStringSubmatch(content, -1)
+	
+	for _, match := range matches {
+		toolCall := ToolCall{
+			Name: strings.TrimSpace(match[1]),
+		}
+		
+		// Parse arguments if provided
+		if len(match) > 2 && match[2] != "" {
+			argsStr := strings.TrimSpace(match[2])
+			if argsStr != "" {
+				var args map[string]interface{}
+				if json.Unmarshal([]byte(argsStr), &args) == nil {
+					toolCall.Arguments = args
+				}
+			}
+		}
+		
+		toolCalls = append(toolCalls, toolCall)
+	}
+	
+	return toolCalls
+}
+
+// Execute tool call automatically suggested by LLM
+func (m ChatModel) executeAutoToolCall(toolCall ToolCall) (tea.Model, tea.Cmd) {
+	client := m.getMCPClientForTool(toolCall.Name)
+	if client == nil {
+		// Tool not found, add error message
+		errorMsg := Message{
+			Role:      "system",
+			Content:   fmt.Sprintf("❌ Tool '%s' not found in any active MCP server", toolCall.Name),
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, errorMsg)
+		m.updateViewport()
+		return m, nil
+	}
+	
+	// Add a message showing the tool execution
+	executionMsg := Message{
+		Role:      "system",
+		Content:   fmt.Sprintf("🔧 Executing tool: `%s`...", toolCall.Name),
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, executionMsg)
+	m.updateViewport()
+	
+	// Execute the tool call asynchronously
+	return m, func() tea.Msg {
+		result, err := client.callTool(toolCall.Name, toolCall.Arguments)
+		if err != nil {
+			return autoToolCallResult{
+				toolName: toolCall.Name,
+				error:    err,
+			}
+		}
+		return autoToolCallResult{
+			toolName: toolCall.Name,
+			result:   result,
+		}
+	}
+}
+
+type ToolCall struct {
+	Name      string
+	Arguments map[string]interface{}
+}
+
+type autoToolCallResult struct {
+	toolName string
+	result   interface{}
+	error    error
+}
+
+// Handle result from automatically executed tool call
+func (m ChatModel) handleAutoToolCallResult(result autoToolCallResult) (tea.Model, tea.Cmd) {
+	if result.error != nil {
+		// Add error message
+		errorMsg := Message{
+			Role:      "system",
+			Content:   fmt.Sprintf("❌ Tool '%s' failed: %v", result.toolName, result.error),
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, errorMsg)
+		m.updateViewport()
+		return m, nil
+	}
+	
+	// Format the result using our smart formatter
+	markdownContent := m.formatMCPResponse(result.toolName, result.result)
+	renderedContent := m.renderMarkdown(markdownContent)
+	
+	// Add the formatted result
+	resultMsg := Message{
+		Role:      "assistant",
+		Content:   renderedContent,
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, resultMsg)
+	
+	m.updateViewport()
+	return m, nil
 }
 
 func (m *ChatModel) stopMCPServer(serverName string) error {
