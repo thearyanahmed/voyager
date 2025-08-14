@@ -180,11 +180,22 @@ type ChatModel struct {
 	debugEnabled    bool
 	debugWindow     viewport.Model
 	debugLogs       []string
+	
+	// Tool call processing state
+	toolCallActive     bool
+	toolCallStep       string
+	toolCallData       interface{}
+	toolCallStepIndex  int
 }
 
 type responseMsg struct {
 	content string
 	err     error
+}
+
+type toolCallStepMsg struct {
+	step string
+	data interface{}
 }
 
 type tickMsg time.Time
@@ -275,7 +286,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tickMsg:
-		if m.loading {
+		if m.loading || m.toolCallActive {
 			m.spinnerIndex = (m.spinnerIndex + 1) % len(spinnerFrames)
 			m.updateViewport()
 			return m, tickCmd()
@@ -389,6 +400,9 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = nil
 		}
 		m.updateViewport()
+		
+	case toolCallStepMsg:
+		return m.processToolCallStep()
 	}
 
 	return m, tea.Batch(tiCmd, vpCmd)
@@ -835,13 +849,8 @@ func (m *ChatModel) handleMCPCommand(parts []string) (tea.Model, tea.Cmd) {
 					}
 					m.conversation = append(m.conversation, systemMsg)
 				} else {
-					resultJSON, _ := json.MarshalIndent(result, "", "  ")
-					systemMsg := Message{
-						Role:      "system",
-						Content:   fmt.Sprintf("Tool '%s' result:\n%s", toolName, string(resultJSON)),
-						Timestamp: time.Now(),
-					}
-					m.conversation = append(m.conversation, systemMsg)
+					// Start the interactive tool call process
+					return m.startToolCallProcess(toolName, arguments, result)
 				}
 			}
 		}
@@ -957,6 +966,82 @@ func (m *ChatModel) startMCPServer(serverName string) error {
 	}()
 
 	return nil
+}
+
+func (m ChatModel) startToolCallProcess(toolName string, arguments map[string]interface{}, result interface{}) (tea.Model, tea.Cmd) {
+	// Add user message showing the tool call
+	argsJSON := ""
+	if arguments != nil {
+		if argsBytes, err := json.Marshal(arguments); err == nil {
+			argsJSON = " " + string(argsBytes)
+		}
+	}
+	
+	userMsg := Message{
+		Role:      "user",
+		Content:   fmt.Sprintf("/mcp call %s%s", toolName, argsJSON),
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, userMsg)
+	
+	// Set up tool call state
+	m.toolCallActive = true
+	m.toolCallStep = "Making tool call..."
+	m.toolCallData = result
+	m.toolCallStepIndex = 0
+	
+	m.updateViewport()
+	
+	// Start the first step
+	return m, func() tea.Msg {
+		return toolCallStepMsg{step: "processing", data: result}
+	}
+}
+
+func (m ChatModel) processToolCallStep() (tea.Model, tea.Cmd) {
+	steps := []string{
+		"Making tool call...",
+		"Processing result...", 
+		"Formatting response...",
+		"Finalizing...",
+	}
+	
+	if m.toolCallStepIndex < len(steps) {
+		m.toolCallStep = steps[m.toolCallStepIndex]
+		m.toolCallStepIndex++
+		m.updateViewport()
+		
+		// Continue to next step after a short delay
+		return m, tea.Tick(time.Millisecond*800, func(t time.Time) tea.Msg {
+			return toolCallStepMsg{step: "continue", data: m.toolCallData}
+		})
+	} else {
+		// Final step: send to LLM for formatting
+		return m.finishToolCall()
+	}
+}
+
+func (m ChatModel) finishToolCall() (tea.Model, tea.Cmd) {
+	// Format the result as JSON
+	resultJSON, _ := json.MarshalIndent(m.toolCallData, "", "  ")
+	
+	// Add system message with the tool result for LLM to format
+	systemMsg := Message{
+		Role:      "system",
+		Content:   fmt.Sprintf("The MCP tool returned the following result. Please format this in a beautiful, human-readable way and explain what it means:\n\n```json\n%s\n```", string(resultJSON)),
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, systemMsg)
+	
+	// Reset tool call state and start LLM processing
+	m.toolCallActive = false
+	m.toolCallStep = ""
+	m.toolCallData = nil
+	m.toolCallStepIndex = 0
+	m.loading = true
+	
+	m.updateViewport()
+	return m, m.sendMessage()
 }
 
 func (m *ChatModel) stopMCPServer(serverName string) error {
@@ -1323,6 +1408,12 @@ func (m *ChatModel) updateViewport() {
 	if m.loading {
 		spinner := spinnerFrames[m.spinnerIndex]
 		content.WriteString(msgContentStyle.Render(fmt.Sprintf("%s thinking...", spinner)))
+		content.WriteString("\n")
+	}
+	
+	if m.toolCallActive {
+		spinner := spinnerFrames[m.spinnerIndex]
+		content.WriteString(msgContentStyle.Render(fmt.Sprintf("%s %s", spinner, m.toolCallStep)))
 		content.WriteString("\n")
 	}
 
