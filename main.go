@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -37,10 +38,10 @@ type Provider struct {
 
 // Configuration
 type Config struct {
-	Providers       map[string]Provider   `json:"providers"`
-	DefaultModel    string                `json:"default_model"`
-	DefaultProvider string                `json:"default_provider"`
-	MCPServers      map[string]MCPServer  `json:"mcp_servers,omitempty"`
+	Providers       map[string]Provider  `json:"providers"`
+	DefaultModel    string               `json:"default_model"`
+	DefaultProvider string               `json:"default_provider"`
+	MCPServers      map[string]MCPServer `json:"mcp_servers,omitempty"`
 }
 
 // Message represents a chat message
@@ -98,10 +99,10 @@ type JSONRPCNotification struct {
 }
 
 type JSONRPCResponse struct {
-	JSONRPC string                 `json:"jsonrpc"`
-	ID      int                    `json:"id,omitempty"`
-	Result  interface{}            `json:"result,omitempty"`
-	Error   *JSONRPCError         `json:"error,omitempty"`
+	JSONRPC string        `json:"jsonrpc"`
+	ID      int           `json:"id,omitempty"`
+	Result  interface{}   `json:"result,omitempty"`
+	Error   *JSONRPCError `json:"error,omitempty"`
 }
 
 type JSONRPCError struct {
@@ -117,9 +118,10 @@ var (
 			Padding(0, 1).
 			Bold(true)
 
-	statusStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#626262")).
-			Italic(true)
+	smallInfoStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			MarginLeft(2)
+
 	userMsgStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#A0A0A0")).
 			Bold(true).
@@ -204,7 +206,7 @@ func initialModel(config *Config, debugEnabled bool) ChatModel {
 
 	vp := viewport.New(80, 20)
 	vp.SetContent("")
-	
+
 	// Initialize debug window
 	debugVp := viewport.New(80, 3)
 	if debugEnabled {
@@ -238,7 +240,7 @@ func initialModel(config *Config, debugEnabled bool) ChatModel {
 		debugWindow:     debugVp,
 		debugLogs:       []string{},
 	}
-	
+
 	// Add initial debug logs
 	if debugEnabled {
 		model_instance.debugLog("CONFIG", "Configuration loaded with %d providers", len(config.Providers))
@@ -247,7 +249,7 @@ func initialModel(config *Config, debugEnabled bool) ChatModel {
 			model_instance.debugLog("CONFIG", "Found %d MCP servers configured", len(config.MCPServers))
 		}
 	}
-	
+
 	return model_instance
 }
 
@@ -313,6 +315,11 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			textareaWidth = 10
 		}
 		m.textarea.SetWidth(textareaWidth)
+
+		// Update viewport content when ready is first set to true
+		if m.ready {
+			m.updateViewport()
+		}
 
 	case tea.KeyMsg:
 		switch msg.Type {
@@ -553,7 +560,7 @@ func (m ChatModel) sendMessage() tea.Cmd {
 
 func (m ChatModel) makeAPIRequest() (string, error) {
 	provider := m.config.Providers[m.currentProvider]
-	
+
 	// Cast to *ChatModel for debug logging
 	model := &m
 	model.debugLog("API", "Starting API request to %s/%s", m.currentProvider, m.currentModel)
@@ -566,11 +573,6 @@ func (m ChatModel) makeAPIRequest() (string, error) {
 		return "", fmt.Errorf("unknown provider type: %s", provider.Type)
 	}
 }
-
-
-
-
-
 
 func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 	type DigitalOceanRequest struct {
@@ -615,7 +617,7 @@ func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 	// Cast to *ChatModel for debug logging
 	model := &m
 	model.debugLog("NET", "Sending OpenAI request to %s", provider.BaseURL)
-	
+
 	req, err := http.NewRequest("POST", provider.BaseURL, bytes.NewBuffer(requestBody))
 	if err != nil {
 		model.debugLog("ERROR", "Failed to create OpenAI request: %v", err)
@@ -631,7 +633,7 @@ func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 		return "", fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	model.debugLog("NET", "OpenAI response received (status: %s)", resp.Status)
 
 	body, err := io.ReadAll(resp.Body)
@@ -645,7 +647,7 @@ func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 		if apiResp.Error != nil {
 			return "", fmt.Errorf("API error: %s", apiResp.Error.Message)
 		}
-		
+
 		if len(apiResp.Choices) > 0 {
 			return apiResp.Choices[0].Message.Content, nil
 		}
@@ -667,7 +669,7 @@ func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 		if text, ok := genericResp["text"].(string); ok {
 			return text, nil
 		}
-		
+
 		// Check for nested content
 		if data, ok := genericResp["data"].(map[string]interface{}); ok {
 			if content, ok := data["content"].(string); ok {
@@ -754,12 +756,12 @@ func (m *ChatModel) handleMCPCommand(parts []string) (tea.Model, tea.Cmd) {
 			}
 			serverList = append(serverList, fmt.Sprintf("  %s (%s) - %s", name, server.Name, status))
 		}
-		
+
 		content := "MCP Servers:\n" + strings.Join(serverList, "\n")
 		if len(serverList) == 0 {
 			content = "No MCP servers configured"
 		}
-		
+
 		systemMsg := Message{
 			Role:      "system",
 			Content:   content,
@@ -777,12 +779,12 @@ func (m *ChatModel) handleMCPCommand(parts []string) (tea.Model, tea.Cmd) {
 			}
 			toolList = append(toolList, fmt.Sprintf("  %s - %s", tool.Name, desc))
 		}
-		
+
 		content := "Available MCP Tools:\n" + strings.Join(toolList, "\n")
 		if len(toolList) == 0 {
 			content = "No MCP tools available (start an MCP server first)"
 		}
-		
+
 		systemMsg := Message{
 			Role:      "system",
 			Content:   content,
@@ -801,7 +803,7 @@ func (m *ChatModel) handleMCPCommand(parts []string) (tea.Model, tea.Cmd) {
 		} else {
 			toolName := parts[1]
 			var arguments map[string]interface{}
-			
+
 			if len(parts) > 2 {
 				jsonArg := strings.Join(parts[2:], " ")
 				if err := json.Unmarshal([]byte(jsonArg), &arguments); err != nil {
@@ -859,7 +861,7 @@ func (m *ChatModel) handleMCPCommand(parts []string) (tea.Model, tea.Cmd) {
 
 func (m *ChatModel) startMCPServer(serverName string) error {
 	m.debugLog("MCP", "Starting MCP server: %s", serverName)
-	
+
 	server, exists := m.config.MCPServers[serverName]
 	if !exists {
 		m.debugLog("ERROR", "MCP server '%s' not found in configuration", serverName)
@@ -888,17 +890,17 @@ func (m *ChatModel) startMCPServer(serverName string) error {
 		// Start the MCP server process
 		cmd := exec.Command(expandedCommand[0], expandedCommand[1:]...)
 		cmd.Env = append(os.Environ(), expandedEnv...)
-		
+
 		// Debug: log the command being executed
 		m.debugLog("MCP", "Starting MCP server with command: %v", expandedCommand)
 		m.debugLog("MCP", "Environment: %v", expandedEnv)
-		
+
 		// Capture stderr for debugging
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		// Keep current working directory for environment access
 		// cmd.Dir = os.TempDir() // Run in temp directory
-		
+
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
 			return
@@ -918,7 +920,7 @@ func (m *ChatModel) startMCPServer(serverName string) error {
 		// Increase buffer size to handle large MCP responses (default is 64KB, set to 1MB)
 		buf := make([]byte, 0, 64*1024)
 		scanner.Buffer(buf, 1024*1024)
-		
+
 		client := &MCPClient{
 			Server:    &server,
 			Process:   cmd,
@@ -932,7 +934,7 @@ func (m *ChatModel) startMCPServer(serverName string) error {
 
 		// Give server time to start
 		time.Sleep(1 * time.Second)
-		
+
 		// Try to initialize
 		if err := client.initialize(); err != nil {
 			m.debugLog("ERROR", "Failed to initialize MCP server: %v", err)
@@ -946,20 +948,20 @@ func (m *ChatModel) startMCPServer(serverName string) error {
 
 		// Try to discover capabilities
 		client.discoverCapabilities()
-		
+
 		// Mark as active
 		if server, exists := m.config.MCPServers[serverName]; exists {
 			server.Active = true
 			m.config.MCPServers[serverName] = server
 		}
 	}()
-	
+
 	return nil
 }
 
 func (m *ChatModel) stopMCPServer(serverName string) error {
 	m.debugLog("MCP", "Stopping MCP server: %s", serverName)
-	
+
 	client, exists := m.mcpClients[serverName]
 	if !exists {
 		m.debugLog("ERROR", "MCP server '%s' is not running", serverName)
@@ -974,7 +976,7 @@ func (m *ChatModel) stopMCPServer(serverName string) error {
 
 	delete(m.mcpClients, serverName)
 	m.debugLog("SUCCESS", "MCP server stopped: %s", serverName)
-	
+
 	if server, exists := m.config.MCPServers[serverName]; exists {
 		server.Active = false
 		m.config.MCPServers[serverName] = server
@@ -1011,7 +1013,7 @@ func (client *MCPClient) sendRequest(method string, params interface{}) (*JSONRP
 	// Read response with very short timeout to prevent hanging
 	responseChan := make(chan JSONRPCResponse, 1)
 	errorChan := make(chan error, 1)
-	
+
 	go func() {
 		if client.Stdout.Scan() {
 			responseData := client.Stdout.Bytes()
@@ -1023,7 +1025,7 @@ func (client *MCPClient) sendRequest(method string, params interface{}) (*JSONRP
 			if client.DebugLog != nil {
 				client.DebugLog("NET", "Received MCP response (%d bytes): %s", len(responseData), debugOutput)
 			}
-			
+
 			var response JSONRPCResponse
 			if err := json.Unmarshal(responseData, &response); err != nil {
 				if client.DebugLog != nil {
@@ -1194,10 +1196,10 @@ func expandMCPEnvVar(envVar string) string {
 		// Note: No debug logging here as this function doesn't have access to debug context
 		return envVar // Return as-is if not in KEY=VALUE format
 	}
-	
+
 	key := parts[0]
 	value := parts[1]
-	
+
 	// Check if value starts with ${ and ends with }
 	if strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") {
 		// Extract the environment variable name
@@ -1206,7 +1208,7 @@ func expandMCPEnvVar(envVar string) string {
 		envValue := os.Getenv(envName)
 		return key + "=" + envValue
 	}
-	
+
 	// Return as-is if not in ${...} format
 	return envVar
 }
@@ -1216,46 +1218,56 @@ func (m *ChatModel) debugLog(level string, message string, args ...interface{}) 
 	if !m.debugEnabled {
 		return
 	}
-	
+
 	// Color codes for labels only
 	colors := map[string]string{
 		"INFO":    "\033[36m", // Cyan
-		"ERROR":   "\033[31m", // Red  
+		"ERROR":   "\033[31m", // Red
 		"SUCCESS": "\033[32m", // Green
 		"WARN":    "\033[33m", // Yellow
 		"MCP":     "\033[35m", // Magenta
 		"NET":     "\033[34m", // Blue
 		"API":     "\033[93m", // Bright Yellow
-		"TUI":     "\033[97m", // Bright White
+		"TUI":     "\033[90m", // Dim Gray (matching placeholder opacity)
 		"CONFIG":  "\033[96m", // Bright Cyan
 		"AUTH":    "\033[95m", // Bright Magenta
 		"LOAD":    "\033[92m", // Bright Green
 		"SAVE":    "\033[94m", // Bright Blue
 	}
 	reset := "\033[0m"
-	
+
 	// Format timestamp
 	timestamp := time.Now().Format("15:04:05")
-	
+
 	// Get color for level
 	color, exists := colors[level]
 	if !exists {
 		color = colors["INFO"]
 	}
-	
+
 	// Format the message with only the label colored
 	formattedMsg := fmt.Sprintf(message, args...)
-	logLine := fmt.Sprintf("[%s%s%s] %s %s", 
-		color, level, reset,
-		timestamp,
-		formattedMsg)
-	
+	dimGray := "\033[90m" // Dim gray for timestamps and TUI messages
+
+	var logLine string
+	if level == "TUI" {
+		// For TUI messages, make everything dimmed (label, timestamp, content)
+		logLine = fmt.Sprintf("%s[%s] %s %s%s",
+			dimGray, level, timestamp, formattedMsg, reset)
+	} else {
+		// For other messages, colored label with dimmed timestamp
+		logLine = fmt.Sprintf("[%s%s%s] %s%s%s %s",
+			color, level, reset,
+			dimGray, timestamp, reset,
+			formattedMsg)
+	}
+
 	// Add to debug logs (keep only last 100 lines for more history)
 	m.debugLogs = append(m.debugLogs, logLine)
 	if len(m.debugLogs) > 100 {
 		m.debugLogs = m.debugLogs[len(m.debugLogs)-100:]
 	}
-	
+
 	// Update debug window content
 	m.debugWindow.SetContent(strings.Join(m.debugLogs, "\n"))
 	m.debugWindow.GotoBottom()
@@ -1275,6 +1287,24 @@ func (m *ChatModel) updateTextareaHeight() {
 func (m *ChatModel) updateViewport() {
 	var content strings.Builder
 
+	// Always add ASCII art at the beginning of content
+	asciiArt := `
+    ██╗   ██╗ ██████╗ ██╗   ██╗ █████╗  ██████╗ ███████╗██████╗
+    ██║   ██║██╔═══██╗╚██╗ ██╔╝██╔══██╗██╔════╝ ██╔════╝██╔══██╗
+    ██║   ██║██║   ██║ ╚████╔╝ ███████║██║  ███╗█████╗  ██████╔╝
+    ╚██╗ ██╔╝██║   ██║  ╚██╔╝  ██╔══██║██║   ██║██╔══╝  ██╔══██╗
+     ╚████╔╝ ╚██████╔╝   ██║   ██║  ██║╚██████╔╝███████╗██║  ██║
+      ╚═══╝   ╚═════╝    ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝
+
+                       Multi-Provider LLM CLI
+`
+	content.WriteString(lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#8B4513")).
+		Bold(true).
+		Render(asciiArt))
+	content.WriteString("\n\n")
+
+	// Add conversation messages
 	for _, msg := range m.conversation {
 		switch msg.Role {
 		case "user":
@@ -1302,7 +1332,23 @@ func (m *ChatModel) updateViewport() {
 	}
 
 	m.viewport.SetContent(content.String())
-	m.viewport.GotoBottom()
+
+	// If there are no conversation messages, show the ASCII art centered
+	// Otherwise, scroll to bottom to show latest messages
+	if len(m.conversation) == 0 && !m.loading && m.err == nil {
+		// Center the ASCII art vertically in the viewport
+		lines := strings.Count(asciiArt, "\n")
+		viewportLines := m.viewport.Height
+		if lines < viewportLines {
+			offset := (viewportLines - lines) / 2
+			if offset > 0 {
+				m.viewport.LineDown(offset)
+			}
+		}
+	} else {
+		// Scroll to bottom to show latest content
+		m.viewport.GotoBottom()
+	}
 }
 
 func (m ChatModel) View() string {
@@ -1310,17 +1356,21 @@ func (m ChatModel) View() string {
 		return "\n  Initializing Voyager..."
 	}
 
-	// Header with voyager branding
-	title := titleStyle.Render(fmt.Sprintf(" VOYAGER - %s/%s ", m.currentProvider, m.currentModel))
+	// Get current working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "unknown"
+	} else {
+		cwd = filepath.Base(cwd)
+	}
 
-	// Status line
-	status := statusStyle.Render(fmt.Sprintf("Provider: %s | Model: %s | Messages: %d",
-		m.currentProvider, m.currentModel, len(m.conversation)))
+	// Small info line with provider, model, and working directory
+	info := smallInfoStyle.Render(fmt.Sprintf("%s/%s • %s", m.currentProvider, m.currentModel, cwd))
 
 	// Help
 	help := helpStyle.Render("Controls: Enter=Send • Ctrl+C=Quit • /help=Commands")
 
-	// Chat area without border
+	// Chat area without border - this now contains the ASCII art when appropriate
 	chatArea := lipgloss.NewStyle().
 		Padding(0, 2).
 		Height(m.viewport.Height).
@@ -1344,8 +1394,7 @@ func (m ChatModel) View() string {
 	if m.debugEnabled {
 		return lipgloss.JoinVertical(
 			lipgloss.Left,
-			title,
-			status,
+			info,
 			"",
 			chatArea,
 			"",
@@ -1356,8 +1405,7 @@ func (m ChatModel) View() string {
 	} else {
 		return lipgloss.JoinVertical(
 			lipgloss.Left,
-			title,
-			status,
+			info,
 			"",
 			chatArea,
 			"",
@@ -1399,35 +1447,35 @@ func loadEnvFile(filename string) error {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		
+
 		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		
+
 		// Split on first = to separate key from value
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
 			continue
 		}
-		
+
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
-		
+
 		// Remove quotes if present
 		if len(value) >= 2 {
 			if (strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"")) ||
-			   (strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'")) {
+				(strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'")) {
 				value = value[1 : len(value)-1]
 			}
 		}
-		
+
 		// Set the environment variable if it's not already set
 		if os.Getenv(key) == "" {
 			os.Setenv(key, value)
 		}
 	}
-	
+
 	return scanner.Err()
 }
 
@@ -1659,7 +1707,7 @@ Examples:
 		Run: func(cmd *cobra.Command, args []string) {
 			// Get all args including those after --
 			allArgs := os.Args[3:] // Skip "voyager mcp add"
-			
+
 			// Find the position of "--"
 			dashIndex := -1
 			for i, arg := range allArgs {
@@ -1668,7 +1716,7 @@ Examples:
 					break
 				}
 			}
-			
+
 			if dashIndex == -1 {
 				fmt.Println("Error: Command must be specified after '--'")
 				fmt.Println("Example: voyager mcp add myserver -- npx server-command")
@@ -1677,9 +1725,9 @@ Examples:
 
 			serverName := allArgs[0]
 			command := allArgs[dashIndex+1:]
-			
+
 			envVars, _ := cmd.Flags().GetStringArray("env")
-			
+
 			config, err := loadConfig()
 			if err != nil {
 				fmt.Printf("Error loading config: %v\n", err)
