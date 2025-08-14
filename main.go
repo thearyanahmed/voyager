@@ -275,11 +275,21 @@ type ChatModel struct {
 	
 	// Native tools
 	nativeTools        map[string]NativeTool
+	
+	// Streaming state
+	streamingContent   strings.Builder
+	streaming         bool
 }
 
 type responseMsg struct {
 	content string
 	err     error
+}
+
+type streamChunkMsg struct {
+	chunk string
+	done  bool
+	err   error
 }
 
 type toolCallStepMsg struct {
@@ -821,10 +831,63 @@ Esc - Quit`
 }
 
 func (m ChatModel) sendMessage() tea.Cmd {
+	return m.streamingCommand()
+}
+
+// Create a streaming command that will send chunks as they arrive
+func (m ChatModel) streamingCommand() tea.Cmd {
 	return func() tea.Msg {
-		response, err := m.makeAPIRequest()
-		return responseMsg{content: response, err: err}
+		provider := m.config.Providers[m.currentProvider]
+		
+		// Use a channel to communicate between streaming and UI
+		chunkChan := make(chan streamChunkMsg, 10)
+		
+		// Start streaming in background
+		go func() {
+			defer close(chunkChan)
+			
+			err := m.sendDigitalOceanStreamingRequest(provider, func(chunk string) {
+				// Send chunk immediately
+				select {
+				case chunkChan <- streamChunkMsg{chunk: chunk, done: false}:
+				default:
+					// Channel full, skip
+				}
+			})
+			
+			// Send final message
+			if err != nil {
+				chunkChan <- streamChunkMsg{err: err, done: true}
+			} else {
+				chunkChan <- streamChunkMsg{done: true}
+			}
+		}()
+		
+		// Start listening for chunks
+		return m.listenForChunks(chunkChan)
 	}
+}
+
+// Listen for streaming chunks
+func (m ChatModel) listenForChunks(chunkChan <-chan streamChunkMsg) tea.Msg {
+	// For the initial implementation, collect all chunks
+	var fullContent strings.Builder
+	
+	for msg := range chunkChan {
+		if msg.err != nil {
+			return responseMsg{content: "", err: msg.err}
+		}
+		
+		if msg.chunk != "" {
+			fullContent.WriteString(msg.chunk)
+		}
+		
+		if msg.done {
+			break
+		}
+	}
+	
+	return responseMsg{content: fullContent.String(), err: nil}
 }
 
 func (m ChatModel) makeAPIRequest() (string, error) {
@@ -849,6 +912,7 @@ func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 		Messages    []Message `json:"messages"`
 		Temperature float64   `json:"temperature,omitempty"`
 		MaxTokens   int       `json:"max_tokens,omitempty"`
+		Stream      bool      `json:"stream,omitempty"`
 	}
 
 	type DigitalOceanResponse struct {
@@ -963,6 +1027,114 @@ func (m ChatModel) sendDigitalOceanRequest(provider Provider) (string, error) {
 	// If all parsing fails, return the raw response for debugging
 	model.debugLog("ERROR", "Unexpected response format: %s", string(body))
 	return string(body), nil
+}
+
+// Streaming version of DigitalOcean API request
+func (m *ChatModel) sendDigitalOceanStreamingRequest(provider Provider, onChunk func(string)) error {
+	type DigitalOceanRequest struct {
+		Model       string    `json:"model"`
+		Messages    []Message `json:"messages"`
+		Temperature float64   `json:"temperature,omitempty"`
+		MaxTokens   int       `json:"max_tokens,omitempty"`
+		Stream      bool      `json:"stream"`
+	}
+
+	// Prepare messages
+	var messages []Message
+	for _, msg := range m.conversation {
+		messages = append(messages, Message{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
+	}
+
+	// Add available tools context
+	contextStr := m.buildAvailableToolsContext()
+	if contextStr != "" {
+		systemMsg := Message{
+			Role:    "system",
+			Content: contextStr,
+		}
+		messages = append([]Message{systemMsg}, messages...)
+	}
+
+	reqBody := DigitalOceanRequest{
+		Model:    m.currentModel,
+		Messages: messages,
+		Stream:   true,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", provider.BaseURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %v", err)
+	}
+
+	// Expand environment variables in API key
+	apiKey := os.ExpandEnv(provider.APIKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API error: %s", string(body))
+	}
+
+	// Process streaming response
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		
+		// Parse SSE format: "data: {json}"
+		if strings.HasPrefix(line, "data: ") {
+			jsonStr := strings.TrimPrefix(line, "data: ")
+			
+			// Handle [DONE] signal
+			if strings.TrimSpace(jsonStr) == "[DONE]" {
+				break
+			}
+			
+			// Parse streaming response
+			var streamResp struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+				} `json:"choices"`
+			}
+			
+			if err := json.Unmarshal([]byte(jsonStr), &streamResp); err != nil {
+				continue // Skip malformed chunks
+			}
+			
+			// Extract content chunk
+			if len(streamResp.Choices) > 0 {
+				chunk := streamResp.Choices[0].Delta.Content
+				if chunk != "" {
+					onChunk(chunk)
+				}
+			}
+		}
+	}
+	
+	return scanner.Err()
 }
 
 // MCP Client methods
