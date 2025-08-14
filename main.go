@@ -23,6 +23,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Helper functions
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // Provider types
 type ProviderType string
 
@@ -248,6 +256,7 @@ type ChatModel struct {
 	toolCallStep       string
 	toolCallData       interface{}
 	toolCallStepIndex  int
+	processingToolResult bool // Flag to prevent tool call detection loops
 	
 	// Orchestrator state
 	orchestratorState  *OrchestratorState
@@ -496,8 +505,13 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.processMCPFieldAnalysis(msg.content)
 			}
 			
-			// Check for tool calls in the response
-			if m.containsToolCalls(msg.content) {
+			// Debug: Log the LLM response
+			if m.processingToolResult {
+				m.debugLog("LLM_RESPONSE", "LLM responded to tool result (length: %d chars): %s", len(msg.content), msg.content[:min(200, len(msg.content))])
+			}
+			
+			// Check for tool calls in the response (but not when processing tool results)
+			if !m.processingToolResult && m.containsToolCalls(msg.content) {
 				return m.processToolCallResponse(msg.content)
 			}
 			
@@ -508,6 +522,12 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.conversation = append(m.conversation, assistantMsg)
 			m.err = nil
+			
+			// Reset tool result processing flag
+			if m.processingToolResult {
+				m.debugLog("LLM_RESPONSE", "Completed tool result processing")
+				m.processingToolResult = false
+			}
 		}
 		m.updateViewport()
 		
@@ -2370,12 +2390,45 @@ func (m *ChatModel) buildToolsContext() string {
 
 // Check if LLM response contains tool calls
 func (m *ChatModel) containsToolCalls(content string) bool {
-	re := regexp.MustCompile(`\[TOOL_CALL:([^:]+)(?::([^\]]*))?\]`)
-	return re.MatchString(content)
+	// Check for both formats: [TOOL_CALL:tool-name] and "TOOL_CALL: tool-name"
+	re1 := regexp.MustCompile(`\[TOOL_CALL:([^:]+)(?::([^\]]*))?\]`)
+	re2 := regexp.MustCompile(`TOOL_CALL:\s*([a-zA-Z0-9_-]+)`)
+	
+	// Debug log the content being checked
+	m.debugLog("TOOL_DETECT", "Checking content for tool calls (length: %d)", len(content))
+	
+	match1 := re1.MatchString(content)
+	match2 := re2.MatchString(content)
+	
+	if match1 || match2 {
+		m.debugLog("TOOL_DETECT", "Found tool call - Format1: %v, Format2: %v", match1, match2)
+	}
+	
+	return match1 || match2
+}
+
+// Clean up malformed LLM responses that contain weird tags
+func (m *ChatModel) cleanMalformedResponse(content string) string {
+	// Remove common malformed tags
+	content = regexp.MustCompile(`<\|[^|]+\|>`).ReplaceAllString(content, "")
+	content = regexp.MustCompile(`<python_tag>`).ReplaceAllString(content, "")
+	content = regexp.MustCompile(`</python_tag>`).ReplaceAllString(content, "")
+	
+	// Clean up excessive whitespace and repeated patterns
+	content = regexp.MustCompile(`\n{3,}`).ReplaceAllString(content, "\n\n")
+	content = regexp.MustCompile(`\s{3,}`).ReplaceAllString(content, " ")
+	
+	// Remove repeated tool call attempts
+	content = regexp.MustCompile(`(🔧 Executing tool: .*?\n){2,}`).ReplaceAllString(content, "🔧 Executing tool: `apps-list`...\n")
+	
+	return strings.TrimSpace(content)
 }
 
 // Process LLM response that contains tool calls
 func (m ChatModel) processToolCallResponse(content string) (tea.Model, tea.Cmd) {
+	// Clean up malformed response content first
+	content = m.cleanMalformedResponse(content)
+	
 	// First, add the LLM's response to conversation (without tool calls)
 	cleanContent := m.removeToolCallTags(content)
 	assistantMsg := Message{
@@ -2402,20 +2455,34 @@ func (m ChatModel) processToolCallResponse(content string) (tea.Model, tea.Cmd) 
 
 // Remove tool call tags from content for display
 func (m *ChatModel) removeToolCallTags(content string) string {
-	re := regexp.MustCompile(`\[TOOL_CALL:[^\]]+\]`)
-	return re.ReplaceAllString(content, "")
+	// Remove both formats
+	re1 := regexp.MustCompile(`\[TOOL_CALL:[^\]]+\]`)
+	content = re1.ReplaceAllString(content, "")
+	
+	re2 := regexp.MustCompile(`TOOL_CALL:\s*[a-zA-Z0-9_-]+`)
+	content = re2.ReplaceAllString(content, "")
+	
+	return strings.TrimSpace(content)
 }
 
 // Extract tool calls from LLM response
 func (m *ChatModel) extractToolCalls(content string) []ToolCall {
 	var toolCalls []ToolCall
-	re := regexp.MustCompile(`\[TOOL_CALL:([^:]+)(?::([^\]]*))?\]`)
-	matches := re.FindAllStringSubmatch(content, -1)
 	
-	for _, match := range matches {
+	m.debugLog("TOOL_EXTRACT", "Extracting tool calls from content: %s", content[:min(200, len(content))])
+	
+	// Format 1: [TOOL_CALL:tool-name:arguments]
+	re1 := regexp.MustCompile(`\[TOOL_CALL:([^:]+)(?::([^\]]*))?\]`)
+	matches1 := re1.FindAllStringSubmatch(content, -1)
+	
+	m.debugLog("TOOL_EXTRACT", "Format 1 matches found: %d", len(matches1))
+	
+	for _, match := range matches1 {
 		toolCall := ToolCall{
 			Name: strings.TrimSpace(match[1]),
 		}
+		
+		m.debugLog("TOOL_EXTRACT", "Found tool call (Format 1): %s", toolCall.Name)
 		
 		// Parse arguments if provided
 		if len(match) > 2 && match[2] != "" {
@@ -2424,6 +2491,9 @@ func (m *ChatModel) extractToolCalls(content string) []ToolCall {
 				var args map[string]interface{}
 				if json.Unmarshal([]byte(argsStr), &args) == nil {
 					toolCall.Arguments = args
+					m.debugLog("TOOL_EXTRACT", "Parsed arguments: %v", args)
+				} else {
+					m.debugLog("TOOL_EXTRACT", "Failed to parse arguments: %s", argsStr)
 				}
 			}
 		}
@@ -2431,6 +2501,21 @@ func (m *ChatModel) extractToolCalls(content string) []ToolCall {
 		toolCalls = append(toolCalls, toolCall)
 	}
 	
+	// Format 2: TOOL_CALL: tool-name
+	re2 := regexp.MustCompile(`TOOL_CALL:\s*([a-zA-Z0-9_-]+)`)
+	matches2 := re2.FindAllStringSubmatch(content, -1)
+	
+	m.debugLog("TOOL_EXTRACT", "Format 2 matches found: %d", len(matches2))
+	
+	for _, match := range matches2 {
+		toolCall := ToolCall{
+			Name: strings.TrimSpace(match[1]),
+		}
+		m.debugLog("TOOL_EXTRACT", "Found tool call (Format 2): %s", toolCall.Name)
+		toolCalls = append(toolCalls, toolCall)
+	}
+	
+	m.debugLog("TOOL_EXTRACT", "Total tool calls extracted: %d", len(toolCalls))
 	return toolCalls
 }
 
@@ -2488,6 +2573,7 @@ type autoToolCallResult struct {
 // Handle result from automatically executed tool call
 func (m ChatModel) handleAutoToolCallResult(result autoToolCallResult) (tea.Model, tea.Cmd) {
 	if result.error != nil {
+		m.debugLog("TOOL_ERROR", "Tool '%s' failed: %v", result.toolName, result.error)
 		// Add error message
 		errorMsg := Message{
 			Role:      "system",
@@ -2499,7 +2585,32 @@ func (m ChatModel) handleAutoToolCallResult(result autoToolCallResult) (tea.Mode
 		return m, nil
 	}
 	
-	// Format the result using our smart formatter
+	// Debug: Print detailed info about the raw tool result
+	switch v := result.result.(type) {
+	case string:
+		m.debugLog("MCP_RESULT", "Tool '%s' returned STRING (length: %d): %s", result.toolName, len(v), v[:min(500, len(v))])
+	case map[string]interface{}:
+		resultJSON, _ := json.MarshalIndent(v, "", "  ")
+		m.debugLog("MCP_RESULT", "Tool '%s' returned MAP (length: %d): %s", result.toolName, len(resultJSON), string(resultJSON)[:min(500, len(resultJSON))])
+	case []interface{}:
+		resultJSON, _ := json.MarshalIndent(v, "", "  ")
+		m.debugLog("MCP_RESULT", "Tool '%s' returned ARRAY (length: %d): %s", result.toolName, len(resultJSON), string(resultJSON)[:min(500, len(resultJSON))])
+	default:
+		resultJSON, _ := json.MarshalIndent(result.result, "", "  ")
+		m.debugLog("MCP_RESULT", "Tool '%s' returned %T (length: %d): %s", result.toolName, result.result, len(resultJSON), string(resultJSON)[:min(500, len(resultJSON))])
+	}
+	
+	// Check if the result is programmatic/non-human friendly
+	isProgrammatic := m.isProgrammaticResponse(result.result)
+	m.debugLog("TOOL_RESULT", "Tool result programmatic check: %v for tool: %s", isProgrammatic, result.toolName)
+	
+	if isProgrammatic {
+		// Use the same sophisticated formatting as MCP calls
+		m.debugLog("TOOL_RESULT", "Using sophisticated formatting for programmatic data")
+		return m.formatMCPResponseWithLLM(result.toolName, result.result)
+	}
+	
+	// Format the result using our smart formatter for human-friendly data
 	markdownContent := m.formatMCPResponse(result.toolName, result.result)
 	renderedContent := m.renderMarkdown(markdownContent)
 	
@@ -2513,6 +2624,195 @@ func (m ChatModel) handleAutoToolCallResult(result autoToolCallResult) (tea.Mode
 	
 	m.updateViewport()
 	return m, nil
+}
+
+// Feed tool result back to LLM for natural language response
+func (m ChatModel) feedbackToolResultToLLM(toolName string, result interface{}) (tea.Model, tea.Cmd) {
+	m.debugLog("LLM_FEEDBACK", "Starting LLM feedback loop for tool: %s", toolName)
+	
+	// First, extract the actual data from MCP response format
+	actualData := m.extractMCPContent(result)
+	
+	// Convert result to JSON for LLM
+	resultJSON, err := json.MarshalIndent(actualData, "", "  ")
+	if err != nil {
+		// Fallback to simple display
+		markdownContent := m.formatMCPResponse(toolName, result)
+		renderedContent := m.renderMarkdown(markdownContent)
+		
+		resultMsg := Message{
+			Role:      "assistant",
+			Content:   renderedContent,
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, resultMsg)
+		m.updateViewport()
+		return m, nil
+	}
+	
+	// Add system message with tool result for LLM to process
+	systemMsg := Message{
+		Role:      "system",
+		Content:   fmt.Sprintf("The MCP tool returned the following result. Please format this in a beautiful, human-readable way and explain what it means:\n\n```json\n%s\n```", string(resultJSON)),
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, systemMsg)
+	
+	// Debug: Show what we're sending to the LLM
+	m.debugLog("LLM_FEEDBACK", "Sending system message to LLM (length: %d chars)", len(systemMsg.Content))
+	
+	// Set flag to prevent tool call loops and trigger LLM to process the tool result
+	m.processingToolResult = true
+	m.loading = true
+	m.updateViewport()
+	return m, m.sendMessage()
+}
+
+// Check if response data is programmatic/non-human friendly
+func (m *ChatModel) isProgrammaticResponse(data interface{}) bool {
+	switch v := data.(type) {
+	case map[string]interface{}:
+		return m.isComplexStructuredData(v)
+	case []interface{}:
+		return m.isComplexArrayData(v)
+	case string:
+		return m.isRawDataString(v)
+	default:
+		return false
+	}
+}
+
+// Check if map contains complex structured data that needs LLM interpretation
+func (m *ChatModel) isComplexStructuredData(data map[string]interface{}) bool {
+	// Check for MCP response wrapper format
+	if content, exists := data["content"]; exists {
+		if contentArray, ok := content.([]interface{}); ok && len(contentArray) > 0 {
+			if firstContent, ok := contentArray[0].(map[string]interface{}); ok {
+				if text, exists := firstContent["text"]; exists {
+					if textStr, ok := text.(string); ok {
+						// Check if the text field contains JSON or other structured data
+						return m.isRawDataString(textStr)
+					}
+				}
+			}
+		}
+	}
+	
+	// Check if it's a complex nested object with technical field names
+	complexFieldCount := 0
+	totalFields := len(data)
+	
+	for key, value := range data {
+		// Technical/programmatic field indicators
+		if m.isTechnicalFieldName(key) {
+			complexFieldCount++
+		}
+		
+		// Deep nested objects indicate programmatic data
+		if nested, ok := value.(map[string]interface{}); ok {
+			if len(nested) > 3 {
+				complexFieldCount++
+			}
+		}
+		
+		// Large arrays suggest raw data dumps
+		if arr, ok := value.([]interface{}); ok {
+			if len(arr) > 5 {
+				complexFieldCount++
+			}
+		}
+	}
+	
+	// If more than 50% of fields are technical/complex, it's programmatic
+	return totalFields > 2 && float64(complexFieldCount)/float64(totalFields) > 0.5
+}
+
+// Check if array contains complex data
+func (m *ChatModel) isComplexArrayData(data []interface{}) bool {
+	if len(data) == 0 {
+		return false
+	}
+	
+	// Check first few items
+	checkCount := len(data)
+	if checkCount > 3 {
+		checkCount = 3
+	}
+	
+	complexItems := 0
+	for i := 0; i < checkCount; i++ {
+		if obj, ok := data[i].(map[string]interface{}); ok {
+			if len(obj) > 5 || m.isComplexStructuredData(obj) {
+				complexItems++
+			}
+		}
+	}
+	
+	// If most items are complex objects, it's programmatic
+	return float64(complexItems)/float64(checkCount) > 0.6
+}
+
+// Check if string contains raw structured data
+func (m *ChatModel) isRawDataString(data string) bool {
+	data = strings.TrimSpace(data)
+	
+	// Check for JSON
+	if (strings.HasPrefix(data, "{") && strings.HasSuffix(data, "}")) ||
+		(strings.HasPrefix(data, "[") && strings.HasSuffix(data, "]")) {
+		var parsed interface{}
+		if json.Unmarshal([]byte(data), &parsed) == nil {
+			return true
+		}
+	}
+	
+	// Check for XML
+	if strings.HasPrefix(data, "<") && strings.HasSuffix(data, ">") {
+		return true
+	}
+	
+	// Check for other structured formats (YAML, etc.)
+	if strings.Contains(data, "---") || strings.Contains(data, "...") {
+		return true
+	}
+	
+	// Check for technical patterns (UUIDs, long hashes, etc.)
+	uuidPattern := regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	if uuidPattern.MatchString(data) {
+		return true
+	}
+	
+	// Long base64 or hash-like strings
+	if len(data) > 50 && regexp.MustCompile(`^[A-Za-z0-9+/=_-]+$`).MatchString(data) {
+		return true
+	}
+	
+	return false
+}
+
+// Check if field name is technical/programmatic
+func (m *ChatModel) isTechnicalFieldName(fieldName string) bool {
+	technicalFields := []string{
+		"id", "uuid", "guid", "hash", "token", "key", "secret",
+		"timestamp", "created_at", "updated_at", "modified_at",
+		"metadata", "config", "settings", "params", "properties",
+		"attributes", "headers", "payload", "data", "raw",
+		"json", "xml", "yaml", "base64", "encoded",
+	}
+	
+	fieldLower := strings.ToLower(fieldName)
+	for _, tech := range technicalFields {
+		if strings.Contains(fieldLower, tech) {
+			return true
+		}
+	}
+	
+	// Check for patterns like "field_name", "fieldName", etc.
+	if strings.Contains(fieldName, "_") || 
+		(fieldName != strings.ToLower(fieldName) && fieldName != strings.ToUpper(fieldName)) {
+		return true
+	}
+	
+	return false
 }
 
 func (m *ChatModel) stopMCPServer(serverName string) error {
@@ -2872,8 +3172,11 @@ func (m *ChatModel) updateViewport() {
 			content.WriteString("\n\n")
 
 		case "system":
-			content.WriteString(systemMsgStyle.Render(msg.Content))
-			content.WriteString("\n\n")
+			// Skip internal TOOL_RESULT messages - they're only for LLM feedback loops
+			if !strings.Contains(msg.Content, "TOOL_RESULT") {
+				content.WriteString(systemMsgStyle.Render(msg.Content))
+				content.WriteString("\n\n")
+			}
 		}
 	}
 
