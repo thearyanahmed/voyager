@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 )
@@ -253,6 +254,9 @@ type ChatModel struct {
 	
 	// Pending MCP formatting
 	pendingMCPFormat   *MCPFormatData
+	
+	// Glamour markdown renderer
+	markdownRenderer   *glamour.TermRenderer
 }
 
 type responseMsg struct {
@@ -323,6 +327,9 @@ func initialModel(config *Config, debugEnabled bool) ChatModel {
 		debugWindow:     debugVp,
 		debugLogs:       []string{},
 	}
+	
+	// Initialize Glamour markdown renderer
+	model_instance.initializeMarkdownRenderer()
 
 	// Add initial debug logs
 	if debugEnabled {
@@ -420,6 +427,9 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.ready {
 			m.updateViewport()
 		}
+		
+		// Update markdown renderer width
+		m.updateMarkdownWidth()
 
 	case tea.KeyMsg:
 		switch msg.Type {
@@ -1031,11 +1041,14 @@ func (m *ChatModel) handleMCPCommand(parts []string) (tea.Model, tea.Cmd) {
 					}
 					m.conversation = append(m.conversation, systemMsg)
 				} else {
-					// Show raw JSON result
+					// Show raw JSON result with Glamour rendering
 					resultJSON, _ := json.MarshalIndent(result, "", "  ")
+					markdownContent := fmt.Sprintf("**Raw JSON result from %s:**\n\n```json\n%s\n```", toolName, string(resultJSON))
+					renderedContent := m.renderMarkdown(markdownContent)
+					
 					systemMsg := Message{
 						Role:      "assistant",
-						Content:   fmt.Sprintf("**Raw JSON result from %s:**\n\n```json\n%s\n```", toolName, string(resultJSON)),
+						Content:   renderedContent,
 						Timestamp: time.Now(),
 					}
 					m.conversation = append(m.conversation, systemMsg)
@@ -1505,10 +1518,13 @@ func (m ChatModel) finishOrchestrator(status, message string) (tea.Model, tea.Cm
 		m.debugLog("ORCHESTRATOR", "Pipeline finished: %s (%v, %d steps)", 
 			status, duration, m.orchestratorState.Context.StepCount)
 		
-		// Add result to conversation
+		// Add result to conversation with Glamour rendering
+		markdownContent := m.formatOrchestratorResults(status, message)
+		renderedContent := m.renderMarkdown(markdownContent)
+		
 		resultMsg := Message{
 			Role:      "assistant",
-			Content:   m.formatOrchestratorResults(status, message),
+			Content:   renderedContent,
 			Timestamp: time.Now(),
 		}
 		m.conversation = append(m.conversation, resultMsg)
@@ -1609,11 +1625,13 @@ func (m ChatModel) formatMCPResponseWithLLM(toolName string, result interface{})
 	keyMap := m.extractAllKeys(actualData)
 	
 	if len(keyMap) == 0 {
-		// Fallback to simple formatting
-		formattedResult := m.formatMCPResponse(toolName, actualData)
+		// Fallback to simple formatting with Glamour
+		markdownContent := m.formatMCPResponse(toolName, actualData)
+		renderedContent := m.renderMarkdown(markdownContent)
+		
 		systemMsg := Message{
 			Role:      "assistant",
-			Content:   formattedResult,
+			Content:   renderedContent,
 			Timestamp: time.Now(),
 		}
 		m.conversation = append(m.conversation, systemMsg)
@@ -2138,25 +2156,30 @@ func (m ChatModel) processMCPFieldAnalysis(response string) (tea.Model, tea.Cmd)
 	if len(priorityFields) == 0 {
 		m.debugLog("ERROR", "Could not parse field priorities from LLM response")
 		// Fallback to simple formatting
-		formattedResult := m.formatMCPResponse(m.pendingMCPFormat.ToolName, m.pendingMCPFormat.Data)
+		markdownContent := m.formatMCPResponse(m.pendingMCPFormat.ToolName, m.pendingMCPFormat.Data)
+		renderedContent := m.renderMarkdown(markdownContent)
+		
 		systemMsg := Message{
 			Role:      "assistant",
-			Content:   formattedResult,
+			Content:   renderedContent,
 			Timestamp: time.Now(),
 		}
 		m.conversation = append(m.conversation, systemMsg)
 	} else {
 		m.debugLog("SUCCESS", "Got field priorities: %v", priorityFields)
 		// Format using LLM-determined priorities
-		formattedResult := m.formatWithLLMPriorities(
+		markdownContent := m.formatWithLLMPriorities(
 			m.pendingMCPFormat.ToolName, 
 			m.pendingMCPFormat.Data, 
 			priorityFields,
 		)
 		
+		// Render with Glamour
+		renderedContent := m.renderMarkdown(markdownContent)
+		
 		systemMsg := Message{
 			Role:      "assistant",
-			Content:   formattedResult,
+			Content:   renderedContent,
 			Timestamp: time.Now(),
 		}
 		m.conversation = append(m.conversation, systemMsg)
@@ -2228,6 +2251,69 @@ func (m *ChatModel) extractFieldsManually(response string) []string {
 	}
 	
 	return fields
+}
+
+// Initialize Glamour markdown renderer
+func (m *ChatModel) initializeMarkdownRenderer() {
+	// Create renderer with auto-detected style (dark/light based on terminal)
+	renderer, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(80), // Default width, will be updated
+	)
+	if err != nil {
+		// Fallback to basic renderer if auto-style fails
+		renderer, _ = glamour.NewTermRenderer(
+			glamour.WithStandardStyle("dark"),
+			glamour.WithWordWrap(80),
+		)
+	}
+	m.markdownRenderer = renderer
+}
+
+// Update markdown renderer width when terminal resizes
+func (m *ChatModel) updateMarkdownWidth() {
+	if m.markdownRenderer == nil {
+		return
+	}
+	
+	// Account for viewport padding and borders
+	effectiveWidth := m.width - 8
+	if effectiveWidth < 40 {
+		effectiveWidth = 40 // Minimum readable width
+	}
+	
+	// Recreate renderer with new width
+	m.initializeMarkdownRendererWithWidth(effectiveWidth)
+}
+
+func (m *ChatModel) initializeMarkdownRendererWithWidth(width int) {
+	renderer, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(width),
+	)
+	if err != nil {
+		// Fallback
+		renderer, _ = glamour.NewTermRenderer(
+			glamour.WithStandardStyle("dark"),
+			glamour.WithWordWrap(width),
+		)
+	}
+	m.markdownRenderer = renderer
+}
+
+// Render markdown content with Glamour
+func (m *ChatModel) renderMarkdown(content string) string {
+	if m.markdownRenderer == nil {
+		return content // Fallback to plain text
+	}
+	
+	rendered, err := m.markdownRenderer.Render(content)
+	if err != nil {
+		m.debugLog("ERROR", "Failed to render markdown: %v", err)
+		return content // Fallback to plain text
+	}
+	
+	return strings.TrimSpace(rendered)
 }
 
 func (m *ChatModel) stopMCPServer(serverName string) error {
