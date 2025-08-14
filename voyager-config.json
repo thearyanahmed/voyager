@@ -15,7 +15,8 @@
   "default_provider": "digitalocean",
   "auto_start_mcps": [
     "digitalocean",
-    "filesystem"
+    "filesystem",
+    "fetch"
   ],
   "mcp_servers": {
     "digitalocean": {
@@ -35,10 +36,18 @@
     "filesystem": {
       "name": "filesystem",
       "command": [
+        "rust-mcp-filesystem",
+        "."
+      ],
+      "env": [],
+      "active": false
+    },
+    "fetch": {
+      "name": "fetch",
+      "command": [
         "npx",
         "-y",
-        "@modelcontextprotocol/server-filesystem",
-        "/Users/paryan/dev/digitalocean/poc/voyager"
+        "puppeteer-mcp-server"
       ],
       "env": [],
       "active": false

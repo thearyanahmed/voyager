@@ -270,6 +270,9 @@ type ChatModel struct {
 	
 	// Glamour markdown renderer
 	markdownRenderer   *glamour.TermRenderer
+	
+	// Native tools
+	nativeTools        map[string]NativeTool
 }
 
 type responseMsg struct {
@@ -339,10 +342,14 @@ func initialModel(config *Config, debugEnabled bool) ChatModel {
 		debugEnabled:    debugEnabled,
 		debugWindow:     debugVp,
 		debugLogs:       []string{},
+		nativeTools:     make(map[string]NativeTool),
 	}
 	
 	// Initialize Glamour markdown renderer
 	model_instance.initializeMarkdownRenderer()
+	
+	// Initialize native tools
+	model_instance.initializeNativeTools()
 
 	// Add initial debug logs
 	if debugEnabled {
@@ -543,6 +550,9 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		
 	case autoToolCallResult:
 		return m.handleAutoToolCallResult(msg)
+		
+	case nativeToolResult:
+		return m.handleNativeToolResult(msg)
 	}
 
 	return m, tea.Batch(tiCmd, vpCmd)
@@ -655,6 +665,7 @@ func (m *ChatModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 /provider <name> - Switch provider
 /providers - List providers
 /models - List models for current provider
+/tools - List all available tools (native + MCP)
 /mcp start <server> - Start MCP server
 /mcp stop <server> - Stop MCP server
 /mcp list - List MCP servers
@@ -674,6 +685,33 @@ Esc - Quit`
 		systemMsg := Message{
 			Role:      "system",
 			Content:   helpText,
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, systemMsg)
+		m.updateViewport()
+
+	case "tools":
+		// List all available tools (native + MCP)
+		var toolList []string
+		
+		// Add native tools
+		for name, tool := range m.nativeTools {
+			toolList = append(toolList, fmt.Sprintf("  %s (native) - %s", name, tool.Description))
+		}
+		
+		// Add MCP tools
+		mcpTools := m.listMCPTools()
+		for _, tool := range mcpTools {
+			desc := tool.Description
+			if desc == "" {
+				desc = "No description available"
+			}
+			toolList = append(toolList, fmt.Sprintf("  %s (mcp) - %s", tool.Name, desc))
+		}
+		
+		systemMsg := Message{
+			Role:      "system",
+			Content:   fmt.Sprintf("Available tools:\n%s", strings.Join(toolList, "\n")),
 			Timestamp: time.Now(),
 		}
 		m.conversation = append(m.conversation, systemMsg)
@@ -2514,6 +2552,11 @@ func (m *ChatModel) extractToolCalls(content string) []ToolCall {
 			}
 		}
 		
+		// Ensure Arguments is never nil - initialize as empty map if not provided
+		if toolCall.Arguments == nil {
+			toolCall.Arguments = make(map[string]interface{})
+		}
+		
 		toolCalls = append(toolCalls, toolCall)
 	}
 	
@@ -2525,7 +2568,8 @@ func (m *ChatModel) extractToolCalls(content string) []ToolCall {
 	
 	for _, match := range matches2 {
 		toolCall := ToolCall{
-			Name: strings.TrimSpace(match[1]),
+			Name:      strings.TrimSpace(match[1]),
+			Arguments: make(map[string]interface{}), // Initialize as empty map
 		}
 		m.debugLog("TOOL_EXTRACT", "Found tool call (Format 2): %s", toolCall.Name)
 		toolCalls = append(toolCalls, toolCall)
@@ -2537,12 +2581,28 @@ func (m *ChatModel) extractToolCalls(content string) []ToolCall {
 
 // Execute tool call automatically suggested by LLM
 func (m ChatModel) executeAutoToolCall(toolCall ToolCall) (tea.Model, tea.Cmd) {
+	// First check if it's a native tool
+	if _, exists := m.nativeTools[toolCall.Name]; exists {
+		m.debugLog("NATIVE_TOOL", "Executing native tool: %s", toolCall.Name)
+		// Add a message showing the tool execution
+		executionMsg := Message{
+			Role:      "system",
+			Content:   fmt.Sprintf("🔧 Executing native tool: `%s`...", toolCall.Name),
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, executionMsg)
+		m.updateViewport()
+		
+		return m.executeNativeTool(toolCall.Name, toolCall.Arguments)
+	}
+	
+	// Then check MCP tools
 	client := m.getMCPClientForTool(toolCall.Name)
 	if client == nil {
-		// Tool not found, add error message
+		// Tool not found anywhere, add error message
 		errorMsg := Message{
 			Role:      "system",
-			Content:   fmt.Sprintf("❌ Tool '%s' not found in any active MCP server", toolCall.Name),
+			Content:   fmt.Sprintf("❌ Tool '%s' not found in native tools or any active MCP server", toolCall.Name),
 			Timestamp: time.Now(),
 		}
 		m.conversation = append(m.conversation, errorMsg)
@@ -2581,6 +2641,19 @@ type ToolCall struct {
 }
 
 type autoToolCallResult struct {
+	toolName string
+	result   interface{}
+	error    error
+}
+
+// Native tool structures
+type NativeTool struct {
+	Name        string
+	Description string
+	Handler     func(args map[string]interface{}) (interface{}, error)
+}
+
+type nativeToolResult struct {
 	toolName string
 	result   interface{}
 	error    error
@@ -3636,6 +3709,172 @@ func (m *ChatModel) extractEnvVars(content string) []string {
 		}
 	}
 	return vars
+}
+
+// Native tool implementations
+func (m *ChatModel) initializeNativeTools() {
+	// Bash tool
+	m.nativeTools["bash"] = NativeTool{
+		Name:        "bash",
+		Description: "Execute shell commands",
+		Handler:     m.handleBashTool,
+	}
+	
+	// Read tool
+	m.nativeTools["read"] = NativeTool{
+		Name:        "read",
+		Description: "Read file contents",
+		Handler:     m.handleReadTool,
+	}
+	
+	// Write tool
+	m.nativeTools["write"] = NativeTool{
+		Name:        "write",
+		Description: "Write file contents",
+		Handler:     m.handleWriteTool,
+	}
+	
+	// Glob tool
+	m.nativeTools["glob"] = NativeTool{
+		Name:        "glob",
+		Description: "Find files matching patterns",
+		Handler:     m.handleGlobTool,
+	}
+	
+	// Grep tool
+	m.nativeTools["grep"] = NativeTool{
+		Name:        "grep",
+		Description: "Search file contents",
+		Handler:     m.handleGrepTool,
+	}
+}
+
+func (m ChatModel) handleNativeToolResult(result nativeToolResult) (tea.Model, tea.Cmd) {
+	if result.error != nil {
+		m.debugLog("NATIVE_TOOL_ERROR", "Tool '%s' failed: %v", result.toolName, result.error)
+		errorMsg := Message{
+			Role:      "system",
+			Content:   fmt.Sprintf("❌ Tool '%s' failed: %v", result.toolName, result.error),
+			Timestamp: time.Now(),
+		}
+		m.conversation = append(m.conversation, errorMsg)
+		m.updateViewport()
+		return m, nil
+	}
+	
+	// Format and display the result
+	resultStr := fmt.Sprintf("%v", result.result)
+	resultMsg := Message{
+		Role:      "assistant",
+		Content:   resultStr,
+		Timestamp: time.Now(),
+	}
+	m.conversation = append(m.conversation, resultMsg)
+	m.updateViewport()
+	
+	return m, nil
+}
+
+func (m ChatModel) executeNativeTool(toolName string, args map[string]interface{}) (tea.Model, tea.Cmd) {
+	if tool, exists := m.nativeTools[toolName]; exists {
+		// Execute the tool asynchronously
+		return m, func() tea.Msg {
+			result, err := tool.Handler(args)
+			return nativeToolResult{
+				toolName: toolName,
+				result:   result,
+				error:    err,
+			}
+		}
+	}
+	
+	return m, nil
+}
+
+func (m *ChatModel) handleBashTool(args map[string]interface{}) (interface{}, error) {
+	command, ok := args["command"].(string)
+	if !ok {
+		return nil, fmt.Errorf("bash tool requires 'command' argument")
+	}
+	
+	cmd := exec.Command("bash", "-c", command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("command failed: %v\nOutput: %s", err, string(output))
+	}
+	
+	return string(output), nil
+}
+
+func (m *ChatModel) handleReadTool(args map[string]interface{}) (interface{}, error) {
+	filePath, ok := args["file_path"].(string)
+	if !ok {
+		return nil, fmt.Errorf("read tool requires 'file_path' argument")
+	}
+	
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %v", err)
+	}
+	
+	return string(content), nil
+}
+
+func (m *ChatModel) handleWriteTool(args map[string]interface{}) (interface{}, error) {
+	filePath, ok := args["file_path"].(string)
+	if !ok {
+		return nil, fmt.Errorf("write tool requires 'file_path' argument")
+	}
+	
+	content, ok := args["content"].(string)
+	if !ok {
+		return nil, fmt.Errorf("write tool requires 'content' argument")
+	}
+	
+	err := os.WriteFile(filePath, []byte(content), 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to write file: %v", err)
+	}
+	
+	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(content), filePath), nil
+}
+
+func (m *ChatModel) handleGlobTool(args map[string]interface{}) (interface{}, error) {
+	pattern, ok := args["pattern"].(string)
+	if !ok {
+		return nil, fmt.Errorf("glob tool requires 'pattern' argument")
+	}
+	
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("glob pattern failed: %v", err)
+	}
+	
+	return matches, nil
+}
+
+func (m *ChatModel) handleGrepTool(args map[string]interface{}) (interface{}, error) {
+	pattern, ok := args["pattern"].(string)
+	if !ok {
+		return nil, fmt.Errorf("grep tool requires 'pattern' argument")
+	}
+	
+	path, ok := args["path"].(string)
+	if !ok {
+		path = "." // Default to current directory
+	}
+	
+	// Use ripgrep-like functionality
+	cmd := exec.Command("grep", "-r", "-n", pattern, path)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// grep returns non-zero when no matches found, which is normal
+		if len(output) == 0 {
+			return "No matches found", nil
+		}
+	}
+	
+	return string(output), nil
 }
 
 func main() {
